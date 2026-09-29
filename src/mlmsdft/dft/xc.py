@@ -17,6 +17,7 @@ __all__ = [
     "lda_xc_dirac_chachiyo",
     "lda_xc_dirac_chachiyo_unpolarized",
     "complementary_sr_lda_unpolarized",
+    "complementary_sr_lda_spin_polarized",
 ]
 
 # Cₓ = (3/4) (3/pi)¹ᐟ³ = 0.7386 from Dirac's exchange-energy, Eqn. (6.1.20) in [Parr&Yang]
@@ -354,6 +355,40 @@ class _ComplementarySRLDAUnpolarized(ScalarFunction):
         return derivative
 
 
+class _ComplementarySRExchange(ScalarFunction):
+    """Unpolarized scalar short-range exchange component."""
+
+    @staticmethod
+    def _evaluate(scalar_density: Tensor, omega: float):
+        values = torch.clamp(scalar_density.detach(), min=0.0)
+        flat = values.reshape(-1).cpu().numpy()
+        if omega == math.inf:
+            value = numpy.zeros_like(flat)
+            derivative = numpy.zeros_like(flat)
+        else:
+            code = "LDA_X" if omega == 0.0 else "LDA_X_ERF"
+            rho = flat[numpy.newaxis, :]
+            exc, vrho, *_ = libxc.eval_xc(
+                code, rho, spin=0, deriv=1,
+                **({} if omega == 0.0 else {"omega": omega}),
+            )
+            value = flat * exc
+            derivative = vrho[0]
+        value = torch.as_tensor(value, dtype=scalar_density.dtype, device=scalar_density.device)
+        derivative = torch.as_tensor(derivative, dtype=scalar_density.dtype, device=scalar_density.device)
+        return value.reshape_as(scalar_density), derivative.reshape_as(scalar_density)
+
+    @staticmethod
+    def value(scalar_density: Tensor, omega: float = 0.0) -> Tensor:
+        value, _derivative = _ComplementarySRExchange._evaluate(scalar_density, omega)
+        return value
+
+    @staticmethod
+    def derivative1(scalar_density: Tensor, omega: float = 0.0) -> Tensor:
+        _value, derivative = _ComplementarySRExchange._evaluate(scalar_density, omega)
+        return derivative
+
+
 def complementary_sr_lda_unpolarized(
         matrix_density: Tensor,
         omega: float,
@@ -370,3 +405,33 @@ def complementary_sr_lda_unpolarized(
     if omega < 0.0:
         raise ValueError(f"omega must be non-negative, got {omega!r}")
     return MatrixFunction.apply(_ComplementarySRLDAUnpolarized, matrix_density, omega)
+
+
+def complementary_sr_lda_spin_polarized(
+        spin_matrix_density: Tensor,
+        omega: float,
+        grad_dummy: Tensor = None,
+        lapl_dummy: Tensor = None,
+    ) -> Tensor:
+    """Collinear spin-polarized complementary srLDA matrix functional.
+
+    Exchange is spin-scaled through the two diagonal spin blocks.  The
+    correlation complement is evaluated on the spin-traced matrix density,
+    matching the existing polarized LMDA convention for scalar correlation
+    generators while retaining the physically distinct alpha/beta exchange.
+    """
+    if omega < 0.0:
+        raise ValueError(f"omega must be non-negative, got {omega!r}")
+    if spin_matrix_density.size()[:2] != (2, 2):
+        raise ValueError("spin_matrix_density must have leading spin-block shape (2, 2)")
+    alpha = spin_matrix_density[0, 0]
+    beta = spin_matrix_density[1, 1]
+    total = alpha + beta
+    # Levy-Perdew spin scaling: E_x[nα,nβ] = 1/2 E_x^u[2nα]
+    # + 1/2 E_x^u[2nβ].  This makes the closed-shell limit exactly equal
+    # to the unpolarized generator evaluated on nα+nβ.
+    exchange_alpha = 0.5 * MatrixFunction.apply(_ComplementarySRExchange, 2.0 * alpha, omega)
+    exchange_beta = 0.5 * MatrixFunction.apply(_ComplementarySRExchange, 2.0 * beta, omega)
+    exchange_total = MatrixFunction.apply(_ComplementarySRExchange, total, omega)
+    correlation = complementary_sr_lda_unpolarized(total, omega) - exchange_total
+    return exchange_alpha + exchange_beta + correlation

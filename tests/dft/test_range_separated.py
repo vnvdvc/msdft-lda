@@ -14,6 +14,7 @@ from mlmsdft.dft.hartree import HartreeFunctionalShortRangeAO
 from mlmsdft.dft.integrals import RangeSeparatedIntegralCache
 from mlmsdft.dft.range_separated import LongRangeInteractionFunctional
 from mlmsdft.dft.spin import SpinType
+from mlmsdft.dft.xc import complementary_sr_lda_spin_polarized
 from mlmsdft.dft.xc import complementary_sr_lda_unpolarized, lda_xc_dirac_chachiyo_unpolarized
 
 
@@ -61,6 +62,19 @@ class TestRangeSeparatedIntegrals(unittest.TestCase):
         torch.testing.assert_close(infinite, torch.zeros_like(infinite))
         finite.sum().backward()
         self.assertTrue(torch.isfinite(density.grad).all())
+
+    def test_spin_polarized_srlda_closed_shell_limit(self):
+        total = torch.diag(torch.tensor([0.1, 0.2], dtype=torch.double))
+        spin_density = torch.zeros(2, 2, 2, 2, dtype=torch.double)
+        spin_density[0, 0] = total / 2.0
+        spin_density[1, 1] = total / 2.0
+        spin_density.requires_grad_(True)
+        for omega in (0.0, 0.4, numpy.inf):
+            unpolarized = complementary_sr_lda_unpolarized(total, omega)
+            polarized = complementary_sr_lda_spin_polarized(spin_density, omega)
+            torch.testing.assert_close(polarized, unpolarized, atol=2e-12, rtol=2e-12)
+        polarized.sum().backward()
+        self.assertTrue(torch.isfinite(spin_density.grad).all())
 
 
 class TestLongRangeTransitionInteraction(unittest.TestCase):
@@ -134,3 +148,32 @@ class TestLongRangeTransitionInteraction(unittest.TestCase):
         )
         H_lr = zero_sr(msmd)
         self.assertTrue(torch.isfinite(H_lr).all())
+
+    def test_target_state_hamiltonian_spin_polarized(self):
+        mol = pyscf.gto.M(
+            atom="H 0 0 -0.35; H 0 0 0.35",
+            basis="sto-3g",
+            charge=0,
+            spin=0,
+            verbose=0,
+        )
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol,
+            norb=2,
+            nelec=(1, 1),
+            target_states=3,
+            spin_symmetry=False,
+            spin_type=SpinType.POLARIZED,
+            guess="hcore",
+        )
+        hamiltonian = HamiltonianTargetStateLMDA(
+            mol,
+            grid_level=1,
+            omega=0.4,
+            spin_type=SpinType.POLARIZED,
+        )
+        H = hamiltonian(msmd)
+        self.assertEqual(tuple(H.shape), (3, 3))
+        self.assertTrue(torch.isfinite(H).all())
+        H.trace().backward()
+        self.assertTrue(torch.isfinite(msmd.orbital_rotation_params.grad).all())

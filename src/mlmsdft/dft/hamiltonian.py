@@ -26,6 +26,7 @@ from mlmsdft.dft.spin import SpinType
 from mlmsdft.dft.spin import concat_spin_blocks, spin_trace
 from mlmsdft.dft.spin import check_not_deprecated_spin_type
 from mlmsdft.dft.spin import spin_blocks_to_pauli_channels
+from mlmsdft.dft.xc import complementary_sr_lda_spin_polarized
 from mlmsdft.dft.xc import lda_x_dirac, lda_c_chachiyo
 # Replace scalar functions by matrix functionals.
 import mlmsdft.nn.functional as MF
@@ -642,10 +643,10 @@ class HamiltonianTargetStateLMDA(Hamiltonian):
         self.spin_type = spin_type
         if spin_type not in SpinType:
             raise ValueError(f"`spin_type` must be instance of SpinType, got {spin_type}")
-        if spin_type not in {SpinType.UNPOLARIZED, SpinType.NONCOLLINEAR}:
+        if spin_type not in {SpinType.UNPOLARIZED, SpinType.POLARIZED, SpinType.NONCOLLINEAR}:
             raise NotImplementedError(
-                "HamiltonianTargetStateLMDA currently supports SpinType.UNPOLARIZED "
-                "and SpinType.NONCOLLINEAR only."
+                "HamiltonianTargetStateLMDA supports SpinType.UNPOLARIZED, "
+                "SpinType.POLARIZED, and SpinType.NONCOLLINEAR only."
             )
         if spin_type == SpinType.NONCOLLINEAR and exchange_correlation_functional is not None:
             raise NotImplementedError(
@@ -674,11 +675,16 @@ class HamiltonianTargetStateLMDA(Hamiltonian):
                     "exchange_correlation_functional is reserved for full-range mode."
                 )
             if short_range_exchange_correlation_functional is None:
-                raise ValueError(
-                    "Range-separated mode requires a complementary short-range "
-                    "exchange-correlation functional."
-                )
-            self.exchange_correlation = short_range_exchange_correlation_functional
+                if spin_type == SpinType.POLARIZED:
+                    self.exchange_correlation = lambda spin_D, *_: complementary_sr_lda_spin_polarized(
+                        spin_D, omega)
+                else:
+                    raise ValueError(
+                        "Range-separated mode requires a complementary short-range "
+                        "exchange-correlation functional."
+                    )
+            else:
+                self.exchange_correlation = short_range_exchange_correlation_functional
             self.long_range_interaction = LongRangeInteractionFunctional(mol, omega)
         else:
             self.long_range_interaction = None
@@ -741,6 +747,15 @@ class HamiltonianTargetStateLMDA(Hamiltonian):
                 xc = 0.0
                 if self.exchange is not None:
                     xc = xc + 2.0 * self.exchange(D / 2.0, None, None)
+                if self.correlation is not None:
+                    xc = xc + self.correlation(D, None, None)
+            elif self.spin_type == SpinType.POLARIZED and self.exchange_correlation is not None:
+                xc = self.exchange_correlation(spin_D, D, None, None)
+            elif self.spin_type == SpinType.POLARIZED:
+                xc = 0.0
+                if self.exchange is not None:
+                    xc = xc + self.exchange(spin_D[0, 0], None, None)
+                    xc = xc + self.exchange(spin_D[1, 1], None, None)
                 if self.correlation is not None:
                     xc = xc + self.correlation(D, None, None)
             elif self.spin_type == SpinType.NONCOLLINEAR:

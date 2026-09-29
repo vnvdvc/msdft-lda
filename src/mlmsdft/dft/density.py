@@ -1738,20 +1738,45 @@ class TargetStateMultistateMatrixDensityCAS(MultistateMatrixDensity):
         for ket, det_ket in enumerate(determinants):
             for spin_a in range(self.nspin):
                 for spin_b in range(self.nspin):
-                    for p in range(self.nmo):
-                        for q in range(self.nmo):
-                            for r in range(self.nmo):
-                                for s in range(self.nmo):
-                                    result = _apply_two_body_operator(
-                                        det_ket, spin_a, spin_b, p, q, r, s, self.nmo
-                                    )
-                                    if result is None:
+                    # Enumerate only occupied annihilation orbitals and
+                    # available creation orbitals.  The previous dense
+                    # p,q,r,s scan was O(nmo^4 * ndet) even though a CAS(2,n)
+                    # determinant has only two occupied spin orbitals.
+                    occupied_r = [
+                        r for r in range(self.nmo)
+                        if (det_ket >> _spin_orbital_index(spin_a, r, self.nmo)) & 1
+                    ]
+                    for r in occupied_r:
+                        first = _apply_annihilation(
+                            det_ket, _spin_orbital_index(spin_a, r, self.nmo))
+                        det_1, phase_1 = first
+                        occupied_s = [
+                            s for s in range(self.nmo)
+                            if (det_1 >> _spin_orbital_index(spin_b, s, self.nmo)) & 1
+                        ]
+                        for s in occupied_s:
+                            second = _apply_annihilation(
+                                det_1, _spin_orbital_index(spin_b, s, self.nmo))
+                            det_2, phase_2 = second
+                            for q in range(self.nmo):
+                                third = _apply_creation(
+                                    det_2, _spin_orbital_index(spin_b, q, self.nmo))
+                                if third is None:
+                                    continue
+                                det_3, phase_3 = third
+                                for p in range(self.nmo):
+                                    fourth = _apply_creation(
+                                        det_3, _spin_orbital_index(spin_a, p, self.nmo))
+                                    if fourth is None:
                                         continue
-                                    det_bra, value = result
+                                    det_bra, phase_4 = fourth
                                     bra = determinant_indices.get(det_bra)
                                     if bra is None:
                                         continue
-                                    entries.append((spin_a, spin_b, p, q, r, s, bra, ket, value))
+                                    entries.append((
+                                        spin_a, spin_b, p, q, r, s,
+                                        bra, ket, phase_1 * phase_2 * phase_3 * phase_4,
+                                    ))
 
         if entries:
             data = numpy.array(entries, dtype=numpy.float64)
