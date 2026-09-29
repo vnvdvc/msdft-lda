@@ -84,7 +84,13 @@ class RangeSeparatedIntegralCache(torch.nn.Module):
     def eri_mo(self, mo_coeff: Tensor, component: str = "long_range") -> Tensor:
         """Transform the selected ERI component to the live MO basis."""
         eri_ao = self.eri_ao(component).to(dtype=mo_coeff.dtype, device=mo_coeff.device)
-        return torch.einsum("ap,bq,cr,ds,abcd->pqrs", mo_coeff, mo_coeff, mo_coeff, mo_coeff, eri_ao)
+        # Contract one AO index at a time.  A single five-operand einsum can
+        # choose a path that materializes an eight-index intermediate; for an
+        # aug-cc-pVDZ H2 calculation that transient exceeds an A800's memory.
+        transformed = torch.einsum("abcd,ap->pbcd", eri_ao, mo_coeff)
+        transformed = torch.einsum("pbcd,bq->pqcd", transformed, mo_coeff)
+        transformed = torch.einsum("pqcd,cr->pqrd", transformed, mo_coeff)
+        return torch.einsum("pqrd,ds->pqrs", transformed, mo_coeff)
 
 
 class OneElectronIntegralCache(torch.nn.Module):
