@@ -67,6 +67,10 @@ def optimize_case(
         guess="rohf",
         target_parameterization="stiefel_k",
     )
+    # The factory creates CPU tensors by design.  Move parameters, buffers,
+    # and operator tables to the requested CUDA device before evaluating the
+    # grid, Hartree, and long-range interaction terms.
+    msmd = msmd.to(torch.device("cuda:0"))
     if previous is not None:
         msmd.orbital_rotation_params.data.copy_(previous.orbital_rotation_params.data)
 
