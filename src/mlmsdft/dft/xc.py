@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import math
+import numpy
 import torch
 from torch import Tensor
 import torch.nn
@@ -7,11 +8,15 @@ import torch.nn.functional
 import torch.linalg
 
 from mlmsdft.nn.functional import ScalarFunction, MatrixFunction
+from pyscf.dft import libxc
 
 
 __all__ = [
     "lda_x_dirac",
     "lda_c_chachiyo",
+    "lda_xc_dirac_chachiyo",
+    "lda_xc_dirac_chachiyo_unpolarized",
+    "complementary_sr_lda_unpolarized",
 ]
 
 # Cₓ = (3/4) (3/pi)¹ᐟ³ = 0.7386 from Dirac's exchange-energy, Eqn. (6.1.20) in [Parr&Yang]
@@ -230,3 +235,138 @@ def lda_c_chachiyo(
     :rtype: Tensor of same shape as input `matrix_density`.
     """
     return MatrixFunction.apply(_LDACorrelationChachiyo, matrix_density, spin)
+
+
+class _LDAXCDiracChachiyo(ScalarFunction):
+    @staticmethod
+    def value(scalar_density: Tensor, spin: int = 0) -> Tensor:
+        return (
+            _LDAExchangeDirac.value(scalar_density) +
+            _LDACorrelationChachiyo.value(scalar_density, spin)
+        )
+
+    @staticmethod
+    def derivative1(scalar_density: Tensor, spin: int = 0) -> Tensor:
+        return (
+            _LDAExchangeDirac.derivative1(scalar_density) +
+            _LDACorrelationChachiyo.derivative1(scalar_density, spin)
+        )
+
+
+def lda_xc_dirac_chachiyo(
+        matrix_density: Tensor,
+        grad_dummy: Tensor = None,
+        lapl_dummy: Tensor = None,
+        spin=0
+    ) -> Tensor:
+    """Fused Dirac exchange plus Chachiyo correlation matrix functional."""
+    return MatrixFunction.apply(_LDAXCDiracChachiyo, matrix_density, spin)
+
+
+class _LDAXCDiracChachiyoUnpolarized(ScalarFunction):
+    @staticmethod
+    def value(scalar_density: Tensor, spin: int = 0) -> Tensor:
+        return (
+            2.0 * _LDAExchangeDirac.value(scalar_density / 2.0) +
+            _LDACorrelationChachiyo.value(scalar_density, spin)
+        )
+
+    @staticmethod
+    def derivative1(scalar_density: Tensor, spin: int = 0) -> Tensor:
+        return (
+            _LDAExchangeDirac.derivative1(scalar_density / 2.0) +
+            _LDACorrelationChachiyo.derivative1(scalar_density, spin)
+        )
+
+
+def lda_xc_dirac_chachiyo_unpolarized(
+        matrix_density: Tensor,
+        grad_dummy: Tensor = None,
+        lapl_dummy: Tensor = None,
+        spin=0
+    ) -> Tensor:
+    """Fused spin-unpolarized LDA XC matrix functional, 2*X(D/2)+C(D)."""
+    return MatrixFunction.apply(_LDAXCDiracChachiyoUnpolarized, matrix_density, spin)
+
+
+class _ComplementarySRLDAUnpolarized(ScalarFunction):
+    """LibXC-backed complementary scalar srLDA.
+
+    The correlation branch follows the implementation plan's initial
+    PW_MOD-minus-PMGB06 choice.  The exact ``omega=0`` and ``omega=inf``
+    branches avoid LibXC's range-parameter sentinel behavior.
+    """
+
+    @staticmethod
+    def _evaluate(scalar_density: Tensor, omega: float):
+        values = torch.clamp(scalar_density.detach(), min=0.0)
+        flat = values.reshape(-1).cpu().numpy()
+        # LDA uses one spin channel and one density variable.  The compact
+        # ``(1, npoints)`` layout is accepted by both the local PySCF bridge
+        # and the newer LibXC bridge on the GPU environment.
+        rho = flat[numpy.newaxis, :]
+
+        if omega == math.inf:
+            value = numpy.zeros_like(flat)
+            derivative = numpy.zeros_like(flat)
+        else:
+            if omega == 0.0:
+                x_code, x_omega = "LDA_X", None
+            else:
+                x_code, x_omega = "LDA_X_ERF", omega
+            x_exc, x_vrho, *_ = libxc.eval_xc(
+                x_code, rho, spin=0, deriv=1, omega=x_omega
+            )
+            if omega == 0.0:
+                c_exc, c_vrho, *_ = libxc.eval_xc(
+                    "LDA_C_PW_MOD", rho, spin=0, deriv=1
+                )
+                exc = x_exc
+                vrho = x_vrho[0]
+                cexc = c_exc
+                cvrho = c_vrho[0]
+            else:
+                c_pw, c_pw_vrho, *_ = libxc.eval_xc(
+                    "LDA_C_PW_MOD", rho, spin=0, deriv=1
+                )
+                c_lr, c_lr_vrho, *_ = libxc.eval_xc(
+                    "LDA_C_PMGB06", rho, spin=0, deriv=1, omega=omega
+                )
+                exc = x_exc
+                vrho = x_vrho[0]
+                cexc = c_pw - c_lr
+                cvrho = c_pw_vrho[0] - c_lr_vrho[0]
+            value = flat * (exc + cexc)
+            derivative = vrho + cvrho
+
+        value = torch.as_tensor(value, dtype=scalar_density.dtype, device=scalar_density.device)
+        derivative = torch.as_tensor(derivative, dtype=scalar_density.dtype, device=scalar_density.device)
+        return value.reshape_as(scalar_density), derivative.reshape_as(scalar_density)
+
+    @staticmethod
+    def value(scalar_density: Tensor, omega: float = 0.0) -> Tensor:
+        value, _derivative = _ComplementarySRLDAUnpolarized._evaluate(scalar_density, omega)
+        return value
+
+    @staticmethod
+    def derivative1(scalar_density: Tensor, omega: float = 0.0) -> Tensor:
+        _value, derivative = _ComplementarySRLDAUnpolarized._evaluate(scalar_density, omega)
+        return derivative
+
+
+def complementary_sr_lda_unpolarized(
+        matrix_density: Tensor,
+        omega: float,
+        grad_dummy: Tensor = None,
+        lapl_dummy: Tensor = None,
+    ) -> Tensor:
+    """Complementary unpolarized srLDA matrix functional.
+
+    For finite ``omega`` this uses erfc exchange plus the PW_MOD minus PMGB06
+    correlation complement.  The result is an energy density per volume and
+    is lifted to the matrix domain with the same divided-difference machinery
+    as the existing LMDA functionals.
+    """
+    if omega < 0.0:
+        raise ValueError(f"omega must be non-negative, got {omega!r}")
+    return MatrixFunction.apply(_ComplementarySRLDAUnpolarized, matrix_density, omega)

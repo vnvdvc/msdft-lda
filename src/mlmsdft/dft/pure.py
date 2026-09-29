@@ -3,7 +3,7 @@
 from abc import ABC
 from torch import Tensor
 
-from mlmsdft.dft.xc import lda_x_dirac, lda_c_chachiyo
+from mlmsdft.dft.xc import lda_x_dirac, lda_c_chachiyo, lda_xc_dirac_chachiyo_unpolarized
 
 
 class PureXCFunctional(ABC):
@@ -39,6 +39,15 @@ class PureXCFunctional(ABC):
         # This method has to be implemented by the hybrid functional.
         return 0.0 * matrix_density
 
+    def exchange_correlation(
+        self,
+        matrix_density: Tensor,
+        grad_D: Tensor,
+        lapl_dummy: Tensor = None
+    ) -> Tensor:
+        return self.exchange(matrix_density, grad_D, lapl_dummy) + self.correlation(
+            matrix_density, grad_D, lapl_dummy)
+
 
 class LDA(PureXCFunctional):
     def exchange(
@@ -64,3 +73,12 @@ class LDA(PureXCFunctional):
         # correlation energy density
         ced = lda_c_chachiyo(matrix_density)
         return ced
+
+    def exchange_correlation(
+        self,
+        matrix_density: Tensor,
+        grad_D: Tensor,
+        lapl_dummy: Tensor = None
+    ) -> Tensor:
+        """Fused Dirac exchange and Chachiyo correlation."""
+        return lda_xc_dirac_chachiyo_unpolarized(matrix_density)

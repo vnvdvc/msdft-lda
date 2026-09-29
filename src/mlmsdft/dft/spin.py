@@ -29,6 +29,21 @@ class SpinType(str, Enum):
     INVARIANT = "spin_invariant"
     # Hamiltonian depends both on total charge density and on spin matrix density.
     INVARIANT_MIX = "spin_invariant_mix"
+    # Hamiltonian depends on the Pauli-channel spin matrix density without forming
+    # the legacy 2N x 2N spin supermatrix.
+    NONCOLLINEAR = "spin_noncollinear"
+
+
+DEPRECATED_SPIN_TYPES = {SpinType.INVARIANT, SpinType.INVARIANT_MIX}
+
+
+def check_not_deprecated_spin_type(spin_type: SpinType) -> None:
+    if spin_type in DEPRECATED_SPIN_TYPES:
+        raise NotImplementedError(
+            f"{spin_type.name} is deprecated and no longer has a computational path. "
+            "Use SpinType.NONCOLLINEAR for spin-covariant LMDA without the "
+            "legacy 2N x 2N spin-supermatrix construction."
+        )
 
 
 def concat_spin_blocks(matrix_density: Tensor) -> Tensor:
@@ -140,6 +155,65 @@ def spin_trace(X: Tensor) -> Tensor:
         'ss...->...', split_spin_blocks(X)
     )
     return spin_trX
+
+
+def spin_blocks_to_pauli_channels(matrix_density: Tensor) -> Tensor:
+    """
+    Convert spin blocks to real Pauli-channel matrix densities.
+
+    The input contains the four spin blocks Daa, Dab, Dba and Dbb. The output
+    stores the spin-traced channel D0 and the three spin-vector channels. The
+    second vector component uses the real convention D2_real = -i D2, so the
+    original complex Pauli-y channel is replaced by the real antisymmetric spin
+    block combination.
+
+        D0 = Daa + Dbb
+        D1 = Dab + Dba
+        D2_real = Dba - Dab
+        D3 = Daa - Dbb
+
+    :param matrix_density: spin-block matrix density with shape (2,2,...,N,N)
+    :return: Pauli-channel matrix density with shape (4,...,N,N)
+    """
+    if matrix_density.size()[:2] != Size([2,2]):
+        raise ValueError(
+            "The first 2 dimensions of the input tensor must index the spin blocks "
+            "aa, ab, ba and bb."
+        )
+    Daa = matrix_density[0,0,...]
+    Dab = matrix_density[0,1,...]
+    Dba = matrix_density[1,0,...]
+    Dbb = matrix_density[1,1,...]
+    return torch.stack(
+        (Daa + Dbb, Dab + Dba, Dba - Dab, Daa - Dbb),
+        dim=0
+    )
+
+
+def pauli_channels_to_spin_blocks(pauli_density: Tensor) -> Tensor:
+    """
+    Reconstruct spin blocks from real Pauli-channel matrix densities.
+
+    This is the inverse of :func:`spin_blocks_to_pauli_channels` for the real
+    Pauli-y convention D2_real = -i D2.
+
+    :param pauli_density: Pauli-channel matrix density with shape (4,...,N,N)
+    :return: spin-block matrix density with shape (2,2,...,N,N)
+    """
+    if pauli_density.size(0) != 4:
+        raise ValueError("The first dimension of the input tensor must contain 4 Pauli channels.")
+    D0, D1, D2_real, D3 = pauli_density
+    Daa = 0.5 * (D0 + D3)
+    Dbb = 0.5 * (D0 - D3)
+    Dab = 0.5 * (D1 - D2_real)
+    Dba = 0.5 * (D1 + D2_real)
+    return torch.stack(
+        (
+            torch.stack((Daa, Dab), dim=0),
+            torch.stack((Dba, Dbb), dim=0),
+        ),
+        dim=0,
+    )
 
 
 def merge_multiplet_energies(energies, spin_multiplicities):

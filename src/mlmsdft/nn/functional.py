@@ -1,6 +1,7 @@
 # coding: utf-8
 """Matrix functionals."""
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
 import torch.linalg
@@ -8,9 +9,57 @@ from torch import Size, Tensor
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
+from mlmsdft.nn.spectral import (
+    cluster_chi,
+    clustered_spectral_descriptors,
+    noncollinear_exchange_carriers,
+    noncollinear_spin_density,
+    reconstruct_cluster_matrix,
+    reconstruct_cluster_matrix_compact,
+    reconstruct_spectral_matrix,
+    robust_symmetric_eigh,
+    spin_partial_trace,
+)
+
 __all__ = [
-    "trace_average"
+    "trace_average",
+    "Level0LMDAParameters",
+    "cluster_chi",
+    "clustered_spectral_descriptors",
+    "reconstruct_cluster_matrix",
+    "reconstruct_cluster_matrix_compact",
+    "reconstruct_spectral_matrix",
+    "noncollinear_exchange_carriers",
+    "noncollinear_spin_density",
+    "spin_partial_trace",
+    "lmda_level0_exchange",
+    "lmda_level0_noncollinear_exchange",
+    "lmda_level0_correlation",
 ]
+
+
+Cx_Dirac = 3.0/4.0 * pow(3.0/torch.pi, 1.0/3.0)
+Cx_Spin = pow(2.0, 1.0/3.0) * Cx_Dirac
+
+
+@dataclass(frozen=True)
+class Level0LMDAParameters:
+    """Trainable compact Level 0 LMDA correction parameters.
+
+    The exchange correction uses ``A_x``, ``beta_x``, ``gamma_x``, and
+    ``chi_width_x``. The correlation correction uses ``A_c``, ``b_c``,
+    ``gamma_c``, and ``chi_width_c``. The defaults switch off both
+    corrections while leaving descriptor widths well-defined.
+    """
+
+    A_x: float = 0.0
+    beta_x: float = 1.0
+    gamma_x: float = 0.0
+    chi_width_x: float = 0.05
+    A_c: float = 0.0
+    b_c: float = 1.0
+    gamma_c: float = 0.0
+    chi_width_c: float = 0.05
 
 
 class ScalarFunction(ABC):
@@ -94,7 +143,7 @@ class MatrixFunction(Function):
         with torch.no_grad():
             # We do not need the gradients of L and U. Anyway, if there are repeated eigenvalues
             # computing continuous eigenvalue derivatives would require higher order derivatives.
-            L, U = torch.linalg.eigh(X)
+            L, U = robust_symmetric_eigh(X)
             # Apply the scalar function to the eigenvalues, f(λₐ)
             fL = function.value(L, *other_args)
             # Compute the matrix function F(X)ᵢⱼ = ∑ₐ Uᵢₐ f(λₐ) Uⱼₐ
@@ -150,34 +199,23 @@ class MatrixFunction(Function):
         function = ctx.function
         other_args = ctx.other_args
 
-        # Construct matrix Yₐᵦ of eigenvalue derivatives.
-        eigval_derivs = torch.zeros_like(U)
-        # Eigenvalues are considered the same, if they differ by less than `epsilon`.
+        # Construct matrix Yₐᵦ of eigenvalue derivatives.  Eigenvalues are
+        # considered the same if they differ by less than `epsilon`.
         epsilon = 1.0e-12
-        # Loop over matrix dimensions
-        n = grad_output.size(dim=-1)
-        for a in range(0, n):
-            La = L[...,a]
-            fLa = fL[...,a]
-            for b in range(0, n):
-                Lb = L[...,b]
-                fLb = fL[...,b]
-                # Which eigenvalue pairs are the same?
-                same = torch.abs(La - Lb) < epsilon
+        La = L.unsqueeze(-1)
+        Lb = L.unsqueeze(-2)
+        fLa = fL.unsqueeze(-1)
+        fLb = fL.unsqueeze(-2)
+        dL = La - Lb
+        same = torch.abs(dL) < epsilon
 
-                # Yₐᵦ has size (...), without the last two dimensions (n,n).
-                Yab = torch.zeros(U.size()[:-2], dtype=U.dtype, device=U.device)
-                # Eigenvalues λₐ=λᵦ to within numerical precision.
-                # To ensure that Y is symmetric, we compute
-                # Yₐᵦ = f'(1/2(λₐ+λᵦ))
-                # for the average of the two eigenvalues.
-                Yab[same] = function.derivative1(0.5 * (La[same] + Lb[same]), *other_args)
-
-                # Eigenvalues are different, λₐ≠λᵦ,
-                # Yₐᵦ = [f(λₐ)-f(λᵦ)]/(λₐ-λᵦ)
-                Yab[~same] = (fLa[~same]-fLb[~same])/(La[~same]-Lb[~same])
-
-                eigval_derivs[...,a,b] = Yab
+        # Yₐᵦ = f'(1/2(λₐ+λᵦ)) for near-degenerate eigenvalues.  The finite
+        # difference branch uses a safe denominator because torch.where evaluates
+        # both branches before selecting values.
+        eigval_derivs_same = function.derivative1(0.5 * (La + Lb), *other_args)
+        safe_dL = torch.where(same, torch.ones_like(dL), dL)
+        eigval_derivs_diff = (fLa - fLb) / safe_dL
+        eigval_derivs = torch.where(same, eigval_derivs_same, eigval_derivs_diff)
 
         # Transform vᵢⱼ into [UvU]ₐᵦ = ∑ᵢ ∑ⱼ Uᵢₐ vᵢⱼ Uⱼᵦ
         UvU = torch.einsum('...ia,...ij,...jb->...ab', U, grad_output, U)
@@ -212,6 +250,109 @@ class Exp(ScalarFunction):
 def exp(tensor):
     """ matrix eponential """
     return MatrixFunction.apply(Exp, tensor)
+
+
+def _parameter_tensor(value, reference: Tensor) -> Tensor:
+    if torch.is_tensor(value):
+        return value.to(dtype=reference.dtype, device=reference.device)
+    return torch.as_tensor(value, dtype=reference.dtype, device=reference.device)
+
+
+def lmda_level0_exchange(matrix_density: Tensor, params: Level0LMDAParameters | None = None, eps: float = 1.0e-12) -> Tensor:
+    """Level 0 spectral exchange energy-density matrix for one carrier.
+
+    This evaluates the Dirac baseline plus the trainable polarization and
+    near-degeneracy correction described in the Level 0 training plan.
+    """
+    params = params or Level0LMDAParameters()
+    spectrum = clustered_spectral_descriptors(matrix_density)
+    chi = cluster_chi(
+        spectrum.s_cluster,
+        spectrum.multiplicity,
+        spectrum.slot_active,
+        spectrum.rho > 1.0e-14,
+        params.chi_width_x,
+    )
+    A_x = _parameter_tensor(params.A_x, matrix_density)
+    beta_x = torch.clamp(_parameter_tensor(params.beta_x, matrix_density), min=eps)
+    gamma_x = _parameter_tensor(params.gamma_x, matrix_density)
+    baseline_values = -_parameter_tensor(Cx_Spin, matrix_density) * torch.pow(
+        spectrum.eigenvalues, 4.0/3.0
+    )
+    baseline = reconstruct_spectral_matrix(baseline_values, spectrum.eigenvectors)
+    f_eta = spectrum.eta / (1.0 + beta_x * spectrum.eta)
+    h_chi = 1.0 + gamma_x * chi
+    correction_values = (
+        torch.pow(spectrum.rho, 4.0/3.0)
+        * spectrum.s_cluster.square()
+        * A_x
+        * f_eta
+        * h_chi
+    )
+    correction = reconstruct_cluster_matrix_compact(
+        correction_values,
+        spectrum.eigenvectors,
+        spectrum.cluster_id,
+        spectrum.model_supported,
+    )
+    return baseline + correction
+
+
+def lmda_level0_noncollinear_exchange(pauli_density: Tensor, params: Level0LMDAParameters | None = None, eps: float = 1.0e-12) -> Tensor:
+    """Level 0 exchange for noncollinear spin matrix density.
+
+    The analytic baseline and learned correction are evaluated on the full
+    spin density, then traced over the spin blocks.
+    """
+    spin_density = noncollinear_spin_density(pauli_density)
+    spin_exchange = lmda_level0_exchange(spin_density, params=params, eps=eps)
+    return spin_partial_trace(spin_exchange)
+
+
+def _chachiyo_correlation_values(lambdas: Tensor, spin: int = 0, eps: float = 1.0e-12) -> Tensor:
+    assert spin in [0, 1]
+    a = (torch.log(torch.as_tensor(2.0, dtype=lambdas.dtype, device=lambdas.device)) - 1.0) / (2 * torch.pi**2)
+    b = 27.4203609 if spin == 1 else 20.4562557
+    if spin == 1:
+        a = 0.5 * a
+    b1 = pow(4.0/3.0 * torch.pi, 1.0/3.0) * b
+    b2 = pow(4.0/3.0 * torch.pi, 2.0/3.0) * b
+    rho = lambdas
+    arg = 1.0 + b1 * torch.pow(rho, 1.0/3.0) + b2 * torch.pow(rho, 2.0/3.0)
+    return a * torch.log(arg) * rho
+
+
+def lmda_level0_correlation(matrix_density: Tensor, params: Level0LMDAParameters | None = None, eps: float = 1.0e-12, spin: int = 0) -> Tensor:
+    """Level 0 spectral correlation energy-density matrix for ``D0``."""
+    params = params or Level0LMDAParameters()
+    spectrum = clustered_spectral_descriptors(matrix_density)
+    chi = cluster_chi(
+        spectrum.s_cluster,
+        spectrum.multiplicity,
+        spectrum.slot_active,
+        spectrum.rho > 1.0e-14,
+        params.chi_width_c,
+    )
+    A_c = _parameter_tensor(params.A_c, matrix_density)
+    b_c = torch.clamp(_parameter_tensor(params.b_c, matrix_density), min=eps)
+    gamma_c = _parameter_tensor(params.gamma_c, matrix_density)
+    baseline_values = _chachiyo_correlation_values(spectrum.eigenvalues, spin=spin, eps=eps)
+    baseline = reconstruct_spectral_matrix(baseline_values, spectrum.eigenvectors)
+    h_chi = 1.0 + gamma_c * chi
+    correction_values = (
+        spectrum.rho
+        * spectrum.s_cluster
+        * A_c
+        * torch.log1p(b_c * spectrum.eta)
+        * h_chi
+    )
+    correction = reconstruct_cluster_matrix_compact(
+        correction_values,
+        spectrum.eigenvectors,
+        spectrum.cluster_id,
+        spectrum.model_supported,
+    )
+    return baseline + correction
 
 
 def trace_average(tensor, weights=None, subspace_dim=None):

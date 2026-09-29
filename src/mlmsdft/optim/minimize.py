@@ -247,8 +247,17 @@ def bfgs_update(invHk, sk, yk, k):
     n = len(sk)
     Id = np.eye(n)
     assert k >= 1
+    curvature = float(np.dot(yk, sk))
+    if not np.isfinite(curvature) or curvature <= 0.0:
+        # A non-positive secant product invalidates the positive-definite BFGS
+        # update.  Resetting is safer than silently constructing an indefinite
+        # inverse-Hessian approximation.
+        return Id
     if k == 1:
-        invHkp1 = np.dot(yk,sk)/np.dot(yk,yk) * Id
+        denominator = np.dot(yk, yk)
+        if denominator <= 0.0 or not np.isfinite(denominator):
+            return Id
+        invHkp1 = curvature / denominator * Id
     else:
         rk = 1.0/np.dot(yk,sk)
         U = Id - rk*np.outer(sk,yk)
@@ -313,9 +322,13 @@ def minimize(objfunc, x0,
     """
     minimize a scalar function ``objfunc``(x) possibly subject to constraints.
 
-    The minimization is converged if
+    For unconstrained problems the minimization is converged if
       * |df/dx| < gtol and
       * |f(k+1)-f(k)| < ftol
+
+    With inequality constraints, the barrier gradient need not vanish at the
+    constrained solution.  In that case a small accepted step together with a
+    small objective change is used as the second-order/KKT stopping signal.
 
     Parameters
     ----------
@@ -408,7 +421,6 @@ def minimize(objfunc, x0,
     fk, grad_fk = func_grad(xk)
     converged = False
     # smallest representable positive number such that 1.0+eps != 1.0.
-    epsilon = np.finfo(float).eps
     for k in range(0, maxiter):
         # determine new search direction
         if method == "Newton":
@@ -426,7 +438,7 @@ def minimize(objfunc, x0,
             else:
                 if np.dot(yk,sk) <= 0.0:
                     if debug > 0:
-                        print( "WARNING: positive definiteness of Hessian approximation lost in BFGS update, since yk.sk <= 0!" )
+                        print( "WARNING: resetting BFGS inverse Hessian because yk.sk <= 0." )
                 invHk = bfgs_update(invHk, sk, yk, k)
             pk = np.dot(invHk,-grad_fk)
         # determine next point by a line search
@@ -443,13 +455,19 @@ def minimize(objfunc, x0,
         # compute change of function value from step k to the next and norm of the gradient
         f_change = abs(f_kp1 - fk)
         gnorm = la.norm(grad_f_kp1)
-        if f_change < ftol and gnorm < gtol:
-            converged = True
-        if f_change < epsilon:
-            # f(k+1) and f(k) cannot be distinguished properly because of finite numerical precision
+        step_norm = la.norm(x_kp1 - xk)
+        constrained_stationary = (
+            constraints is not None and
+            step_norm <= np.sqrt(ftol) and
+            gnorm <= max(gtol, 1.0e-4)
+        )
+        converged = f_change < ftol and (gnorm < gtol or constrained_stationary)
+        if f_change < np.finfo(float).eps:
+            # f(k+1) and f(k) cannot be distinguished in finite precision, but
+            # that alone is not stationarity.  Keep iterating until the gradient
+            # criterion is also satisfied or maxiter is reached.
             if debug > 0:
                 print( "WARNING: |f(k+1) - f(k)| < epsilon  (numerical precision) !" )
-            converged = True
         # step vector
         sk = x_kp1 - xk
         # gradient difference vector

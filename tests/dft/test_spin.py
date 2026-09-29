@@ -9,6 +9,7 @@ import torch.testing
 
 from mlmsdft.dft.spin import SpinType
 from mlmsdft.dft.spin import concat_spin_blocks, split_spin_blocks
+from mlmsdft.dft.spin import spin_blocks_to_pauli_channels, pauli_channels_to_spin_blocks
 from mlmsdft.dft.spin import spin_trace
 from mlmsdft.dft.spin import merge_multiplet_energies
 from mlmsdft.dft.spin import index_within_multiplicity
@@ -108,7 +109,35 @@ class TestSpinTypes(unittest.TestCase):
 
     def test_spin_type_enum(self):
         # Not a useful test
-        self.assertEqual(len(SpinType), 4)
+        self.assertEqual(len(SpinType), 5)
+
+    def test_pauli_channels_collinear(self):
+        nstate = 2
+        D = torch.zeros((2,2,nstate,nstate), dtype=torch.double)
+        Daa = torch.tensor([[1.0, 0.2], [0.2, 0.8]], dtype=torch.double)
+        Dbb = torch.tensor([[0.3, 0.1], [0.1, 0.4]], dtype=torch.double)
+        D[0,0,...] = Daa
+        D[1,1,...] = Dbb
+
+        pauli = spin_blocks_to_pauli_channels(D)
+        torch.testing.assert_close(pauli[0], Daa + Dbb)
+        torch.testing.assert_close(pauli[1], torch.zeros_like(Daa))
+        torch.testing.assert_close(pauli[2], torch.zeros_like(Daa))
+        torch.testing.assert_close(pauli[3], Daa - Dbb)
+        torch.testing.assert_close(pauli_channels_to_spin_blocks(pauli), D)
+
+    def test_pauli_channels_real_y_convention(self):
+        nstate = 2
+        D = torch.zeros((2,2,nstate,nstate), dtype=torch.double)
+        Dab = torch.tensor([[0.0, 0.7], [-0.2, 0.0]], dtype=torch.double)
+        Dba = Dab.T
+        D[0,1,...] = Dab
+        D[1,0,...] = Dba
+
+        pauli = spin_blocks_to_pauli_channels(D)
+        torch.testing.assert_close(pauli[1], Dab + Dba)
+        torch.testing.assert_close(pauli[2], Dba - Dab)
+        torch.testing.assert_close(pauli_channels_to_spin_blocks(pauli), D)
 
     def test_merge_multiplet_energies(self):
         # Energies of triplet are repeated

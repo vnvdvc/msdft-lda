@@ -385,6 +385,220 @@ def _zero_noncommuting_elements(X: Tensor, w: Tensor) -> Tensor:
     return X
 
 class TestMatrixFunction(unittest.TestCase):
+    def test_level0_spectral_descriptor_n1_zero_corrections(self):
+        X = torch.tensor([[[2.0]]], dtype=torch.double)
+        params = functional.Level0LMDAParameters(A_x=1.0, A_c=1.0, gamma_x=2.0, gamma_c=2.0)
+        torch.testing.assert_close(
+            functional.lmda_level0_exchange(X, params),
+            functional.lmda_level0_exchange(X, functional.Level0LMDAParameters()),
+        )
+        torch.testing.assert_close(
+            functional.lmda_level0_correlation(X, params),
+            functional.lmda_level0_correlation(X, functional.Level0LMDAParameters()),
+        )
+
+    def test_level0_analytic_baseline_uses_original_eigenvalues(self):
+        eigenvalues = torch.tensor([0.4, 0.4 + 5.0e-11, 1.2], dtype=torch.double)
+        X = torch.diag(eigenvalues)
+        exchange = functional.lmda_level0_exchange(X)
+        expected_values = -functional.Cx_Spin * eigenvalues.pow(4.0 / 3.0)
+        torch.testing.assert_close(exchange, torch.diag(expected_values))
+        self.assertNotEqual(float(exchange[0, 0]), float(exchange[1, 1]))
+
+    def test_level0_zero_amplitude_matches_baseline(self):
+        X = random_positive_symmetric_matrix_tensor((2,), n=3, eps=1.0e-4)
+        params = functional.Level0LMDAParameters(A_x=0.0, A_c=0.0, beta_x=0.7, gamma_x=3.0, gamma_c=2.0)
+        torch.testing.assert_close(
+            functional.lmda_level0_exchange(X, params),
+            functional.lmda_level0_exchange(X, functional.Level0LMDAParameters()),
+        )
+        torch.testing.assert_close(
+            functional.lmda_level0_correlation(X, params),
+            functional.lmda_level0_correlation(X, functional.Level0LMDAParameters()),
+        )
+
+    def test_level0_functionals_are_covariant(self):
+        params = functional.Level0LMDAParameters(A_x=0.2, beta_x=0.8, gamma_x=0.5, A_c=0.1, b_c=0.7, gamma_c=0.4)
+        check_transformation_property(functional.lmda_level0_exchange, torch.Size([2]), 3, params, positive_definite=True)
+        check_transformation_property(functional.lmda_level0_correlation, torch.Size([2]), 3, params, positive_definite=True)
+
+    def test_level0_noncollinear_exchange_matches_collinear_channels(self):
+        Daa = torch.diag_embed(torch.tensor([[2.0, 1.5, 1.0], [1.7, 1.2, 0.8]], dtype=torch.double))
+        Dbb = torch.diag_embed(torch.tensor([[0.4, 0.3, 0.2], [0.5, 0.2, 0.1]], dtype=torch.double))
+        zero = torch.zeros_like(Daa)
+        pauli = torch.stack((Daa + Dbb, zero, zero, Daa - Dbb), dim=0)
+        result = functional.lmda_level0_noncollinear_exchange(pauli)
+        reference = functional.lmda_level0_exchange(Daa) + functional.lmda_level0_exchange(Dbb)
+        torch.testing.assert_close(result, reference)
+
+    def test_level0_noncollinear_exchange_is_state_covariant(self):
+        generator = torch.tensor(
+            [
+                [0.0, 0.3, -0.2, 0.1],
+                [-0.3, 0.0, 0.4, -0.1],
+                [0.2, -0.4, 0.0, 0.5],
+                [-0.1, 0.1, -0.5, 0.0],
+            ],
+            dtype=torch.double,
+        )
+        full_rotation = torch.linalg.matrix_exp(generator)
+        full_density = full_rotation @ torch.diag(
+            torch.tensor([0.2, 0.5, 1.0, 1.4], dtype=torch.double)
+        ) @ full_rotation.T
+        pauli = self._pauli_from_full_spin_density(full_density)
+        state_rotation = torch.tensor(
+            [[torch.cos(torch.tensor(0.37)), -torch.sin(torch.tensor(0.37))],
+             [torch.sin(torch.tensor(0.37)), torch.cos(torch.tensor(0.37))]],
+            dtype=torch.double,
+        )
+        transformed_pauli = torch.stack(
+            tuple(state_rotation @ channel @ state_rotation.T for channel in pauli), dim=0
+        )
+        full_state_rotation = torch.kron(torch.eye(2, dtype=torch.double), state_rotation)
+        torch.testing.assert_close(
+            functional.noncollinear_spin_density(transformed_pauli),
+            full_state_rotation @ full_density @ full_state_rotation.T,
+        )
+        params = functional.Level0LMDAParameters(A_x=0.2, beta_x=0.8, gamma_x=0.5)
+        result = functional.lmda_level0_noncollinear_exchange(pauli, params)
+        transformed = functional.lmda_level0_noncollinear_exchange(transformed_pauli, params)
+        torch.testing.assert_close(transformed, state_rotation @ result @ state_rotation.T)
+
+    def test_level0_noncollinear_exchange_is_spin_rotation_invariant(self):
+        full_density = torch.tensor(
+            [
+                [1.1, 0.1, 0.2, -0.1],
+                [0.1, 0.9, 0.05, 0.15],
+                [0.2, 0.05, 0.8, 0.0],
+                [-0.1, 0.15, 0.0, 0.7],
+            ],
+            dtype=torch.double,
+        )
+        spin_angle = torch.tensor(0.29, dtype=torch.double)
+        spin_rotation = torch.tensor(
+            [
+                [torch.cos(spin_angle), -torch.sin(spin_angle)],
+                [torch.sin(spin_angle), torch.cos(spin_angle)],
+            ],
+            dtype=torch.double,
+        )
+        full_spin_rotation = torch.kron(spin_rotation, torch.eye(2, dtype=torch.double))
+        pauli = self._pauli_from_full_spin_density(full_density)
+        rotated_pauli = self._pauli_from_full_spin_density(
+            full_spin_rotation @ full_density @ full_spin_rotation.T
+        )
+        params = functional.Level0LMDAParameters(A_x=0.2, beta_x=0.8, gamma_x=0.5)
+        torch.testing.assert_close(
+            functional.lmda_level0_noncollinear_exchange(rotated_pauli, params),
+            functional.lmda_level0_noncollinear_exchange(pauli, params),
+        )
+
+    def test_level0_noncollinear_fitted_parameter_gradients_are_finite(self):
+        D_alpha = torch.diag(torch.tensor([1.4, 0.8], dtype=torch.double))
+        D_beta = torch.diag(torch.tensor([0.3, 0.5], dtype=torch.double))
+        zero = torch.zeros_like(D_alpha)
+        pauli = torch.stack((D_alpha + D_beta, zero, zero, D_alpha - D_beta))
+        fitted = {
+            name: torch.tensor(value, dtype=torch.double, requires_grad=True)
+            for name, value in {
+                "A_x": 0.2,
+                "beta_x": 0.8,
+                "gamma_x": 0.5,
+                "chi_width_x": 0.05,
+            }.items()
+        }
+        result = functional.lmda_level0_noncollinear_exchange(
+            pauli, functional.Level0LMDAParameters(**fitted)
+        )
+        result.sum().backward()
+        for name, parameter in fitted.items():
+            with self.subTest(parameter=name):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(bool(torch.isfinite(parameter.grad)))
+
+    def test_level0_noncollinear_exchange_rejects_scalar_carrier(self):
+        X = random_positive_symmetric_matrix_tensor((2,), n=3, eps=1.0e-4)
+        with self.assertRaises(ValueError):
+            functional.lmda_level0_noncollinear_exchange(X)
+
+    @staticmethod
+    def _pauli_from_full_spin_density(full_density):
+        n = full_density.size(-1) // 2
+        alpha = full_density[..., :n, :n]
+        beta = full_density[..., n:, n:]
+        alpha_beta = full_density[..., :n, n:]
+        beta_alpha = full_density[..., n:, :n]
+        return torch.stack(
+            (
+                alpha + beta,
+                alpha_beta + beta_alpha,
+                alpha_beta - beta_alpha,
+                alpha - beta,
+            ),
+            dim=0,
+        )
+
+    def test_level0_fitted_tensor_parameter_gradients_are_finite(self):
+        X = torch.diag_embed(
+            torch.tensor([[0.2, 0.7, 1.4], [0.3, 0.8, 1.6]], dtype=torch.double)
+        )
+        fitted = {
+            name: torch.tensor(value, dtype=torch.double, requires_grad=True)
+            for name, value in {
+                "A_x": 0.2,
+                "beta_x": 0.8,
+                "gamma_x": 0.5,
+                "chi_width_x": 0.05,
+                "A_c": 0.1,
+                "b_c": 0.7,
+                "gamma_c": 0.4,
+                "chi_width_c": 0.06,
+            }.items()
+        }
+        params = functional.Level0LMDAParameters(**fitted)
+        loss = functional.lmda_level0_exchange(X, params).sum() + functional.lmda_level0_correlation(X, params).sum()
+        loss.backward()
+        for name, parameter in fitted.items():
+            with self.subTest(parameter=name):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(bool(torch.isfinite(parameter.grad)))
+
+    def test_vectorized_divided_differences_match_loop_reference(self):
+        L = torch.tensor(
+            [[0.2, 0.2 + 1.0e-13, 1.7], [0.1, 0.5, 3.0]],
+            dtype=torch.double,
+        )
+        fL = functional.Exp.value(L)
+        epsilon = 1.0e-12
+
+        eigval_derivs_ref = torch.zeros(L.size() + L.size()[-1:], dtype=L.dtype)
+        for a in range(L.size(-1)):
+            La = L[...,a]
+            fLa = fL[...,a]
+            for b in range(L.size(-1)):
+                Lb = L[...,b]
+                fLb = fL[...,b]
+                same = torch.abs(La - Lb) < epsilon
+                Yab = torch.zeros(L.size()[:-1], dtype=L.dtype)
+                Yab[same] = functional.Exp.derivative1(0.5 * (La[same] + Lb[same]))
+                Yab[~same] = (fLa[~same] - fLb[~same]) / (La[~same] - Lb[~same])
+                eigval_derivs_ref[...,a,b] = Yab
+
+        La = L.unsqueeze(-1)
+        Lb = L.unsqueeze(-2)
+        fLa = fL.unsqueeze(-1)
+        fLb = fL.unsqueeze(-2)
+        dL = La - Lb
+        same = torch.abs(dL) < epsilon
+        safe_dL = torch.where(same, torch.ones_like(dL), dL)
+        eigval_derivs_vec = torch.where(
+            same,
+            functional.Exp.derivative1(0.5 * (La + Lb)),
+            (fLa - fLb) / safe_dL,
+        )
+
+        torch.testing.assert_close(eigval_derivs_vec, eigval_derivs_ref)
+
     def test_matrix_dimension_raises_exceptions(self):
         """
         Verify that an exception is raised, if the input tensor to a

@@ -10,6 +10,8 @@ import pyscf.dft
 from mlmsdft.dft.density import MultistateMatrixDensityCAS
 from mlmsdft.dft.xc import lda_x_dirac
 from mlmsdft.dft.xc import lda_c_chachiyo
+from mlmsdft.dft.xc import lda_xc_dirac_chachiyo
+from mlmsdft.dft.xc import lda_xc_dirac_chachiyo_unpolarized
 
 from nn.test_functional import random_orthogonal_matrix
 from nn.test_functional import random_tensor
@@ -21,6 +23,8 @@ from nn.test_functional import (
 lda_xc_functionals = [
     lda_x_dirac,
     lda_c_chachiyo,
+    lda_xc_dirac_chachiyo,
+    lda_xc_dirac_chachiyo_unpolarized,
 ]
 
 
@@ -45,6 +49,26 @@ class TestLDAMatrixFunctionals(unittest.TestCase):
                     with self.subTest(function=func, size=size, dimension=n):
                         check_transformation_property(
                             func, size, n, positive_definite=True)
+
+    def test_fused_lda_xc_matches_separate_terms(self):
+        for n in [1,2,3]:
+            with self.subTest(dimension=n):
+                size = Size([4,n,n])
+                X = random_tensor(size)
+                D = torch.einsum('...ik,...jk->...ij', X, X) + 0.1 * torch.eye(n)
+                fused = lda_xc_dirac_chachiyo(D)
+                separate = lda_x_dirac(D) + lda_c_chachiyo(D)
+                torch.testing.assert_close(fused, separate, rtol=1.0e-10, atol=1.0e-10)
+
+    def test_fused_unpolarized_lda_xc_matches_separate_terms(self):
+        for n in [1,2,3]:
+            with self.subTest(dimension=n):
+                size = Size([4,n,n])
+                X = random_tensor(size)
+                D = torch.einsum('...ik,...jk->...ij', X, X) + 0.1 * torch.eye(n)
+                fused = lda_xc_dirac_chachiyo_unpolarized(D)
+                separate = 2.0 * lda_x_dirac(D / 2.0) + lda_c_chachiyo(D)
+                torch.testing.assert_close(fused, separate, rtol=1.0e-10, atol=1.0e-10)
 
 
 class TestLDAFunctionalsVsLibxc(unittest.TestCase):

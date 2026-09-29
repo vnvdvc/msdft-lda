@@ -11,7 +11,11 @@ where R = -Rᵀ is an antisymmetric parameter matrix, so that U=exp(R) is unitar
 C₀ is an initial guess.
 """
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import json
 import numpy
+from pathlib import Path
+import warnings
 import scipy.linalg
 import torch
 from torch import Size, Tensor
@@ -26,6 +30,126 @@ from pyscf.scf.hf import get_hcore
 from mlmsdft.dft.active_space import ActiveSpace
 from mlmsdft.dft.active_space import ActiveSpaceError
 from mlmsdft.dft.spin import SpinType
+
+
+@dataclass(frozen=True)
+class AOGridBatch:
+    """AO values and integration weights cached for one grid chunk."""
+    weights: Tensor
+    ao_value: Tensor
+    grad_ao_value: Tensor = None
+    lapl_ao_value: Tensor = None
+
+
+@dataclass(frozen=True)
+class OneBodyOperatorTable:
+    """Indexed nonzero entries of one-body transition-density operators."""
+    spin_rows: Tensor
+    spin_cols: Tensor
+    orbital_rows: Tensor
+    orbital_cols: Tensor
+    det_rows: Tensor
+    det_cols: Tensor
+    values: Tensor
+    shape: tuple
+
+
+@dataclass(frozen=True)
+class TwoBodyOperatorTable:
+    """Indexed spin-conserving two-body transition operators."""
+    spin_rows: Tensor
+    spin_cols: Tensor
+    orbital_rows: Tensor
+    orbital_cols: Tensor
+    orbital_annihilate_rows: Tensor
+    orbital_annihilate_cols: Tensor
+    det_rows: Tensor
+    det_cols: Tensor
+    values: Tensor
+    shape: tuple
+
+
+@dataclass(frozen=True)
+class CASGuessComponents:
+    """Minimal CAS construction outputs shared by dense and target-state paths."""
+    orbital_coefficients: Tensor
+    orbital_rotation_params: torch.nn.Parameter
+    active_space: ActiveSpace
+    s2_matrix: Tensor
+    det_to_csf: Tensor
+    nstate: int
+    ndet: int
+
+
+def _spin_orbital_index(spin: int, orbital: int, norb: int) -> int:
+    if spin == 0:
+        return norb + orbital
+    if spin == 1:
+        return orbital
+    raise ValueError("spin index must be 0 (alpha) or 1 (beta)")
+
+
+def _apply_annihilation(det: int, spin_orbital: int):
+    if ((det >> spin_orbital) & 1) == 0:
+        return None
+    phase = -1.0 if ((det & ((1 << spin_orbital) - 1)).bit_count() % 2) else 1.0
+    return det ^ (1 << spin_orbital), phase
+
+
+def _apply_creation(det: int, spin_orbital: int):
+    if ((det >> spin_orbital) & 1) == 1:
+        return None
+    phase = -1.0 if ((det & ((1 << spin_orbital) - 1)).bit_count() % 2) else 1.0
+    return det | (1 << spin_orbital), phase
+
+
+def _apply_one_body_operator(det: int, create_spin: int, annihilate_spin: int, p: int, q: int, norb: int):
+    annihilate_at = _spin_orbital_index(annihilate_spin, q, norb)
+    create_at = _spin_orbital_index(create_spin, p, norb)
+    annihilated = _apply_annihilation(det, annihilate_at)
+    if annihilated is None:
+        return None
+    intermediate, phase_annihilate = annihilated
+    created = _apply_creation(intermediate, create_at)
+    if created is None:
+        return None
+    final_det, phase_create = created
+    return final_det, phase_annihilate * phase_create
+
+
+def _apply_two_body_operator(
+        det: int,
+        create_spin_a: int,
+        create_spin_b: int,
+        p: int,
+        q: int,
+        r: int,
+        s: int,
+        norb: int,
+    ):
+    """Apply ``a†_p a†_q a_s a_r`` to a determinant.
+
+    The two annihilators are applied from right to left, followed by the two
+    creators from right to left.  This ordering matches the proposal's
+    ``Gamma[p,q,r,s] = <a†_p a†_q a_s a_r>`` convention.
+    """
+    first = _apply_annihilation(det, _spin_orbital_index(create_spin_a, r, norb))
+    if first is None:
+        return None
+    det_1, phase_1 = first
+    second = _apply_annihilation(det_1, _spin_orbital_index(create_spin_b, s, norb))
+    if second is None:
+        return None
+    det_2, phase_2 = second
+    third = _apply_creation(det_2, _spin_orbital_index(create_spin_b, q, norb))
+    if third is None:
+        return None
+    det_3, phase_3 = third
+    fourth = _apply_creation(det_3, _spin_orbital_index(create_spin_a, p, norb))
+    if fourth is None:
+        return None
+    final_det, phase_4 = fourth
+    return final_det, phase_1 * phase_2 * phase_3 * phase_4
 
 
 class MultistateMatrixDensity(torch.nn.Module, ABC):
@@ -119,7 +243,13 @@ class MultistateMatrixDensity(torch.nn.Module, ABC):
     # There is no `forward` method. This is because the matrix density is not
     # differentiable with respect to the grid coordinates,
     # because the atomic orbitals are evaluated using pyscf and numpy.
-    def evaluate(self, coords: numpy.ndarray, dm_ao: Tensor = None, need_laplacian=True):
+    def evaluate(
+        self,
+        coords: numpy.ndarray,
+        dm_ao: Tensor = None,
+        need_gradient=True,
+        need_laplacian=True
+    ):
         """
         evaluate the multistate spin matrix density Dˢᵗ(r), its gradient ∇Dˢᵗ(r)
         and its Laplacian ∇²Dˢᵗ(r) on a grid.
@@ -138,6 +268,10 @@ class MultistateMatrixDensity(torch.nn.Module, ABC):
             the member function `density_matrices_ao()`.
         :type dm_ao: Tensor of shape (2,2,Nbasis,Nbasis,Nstate,Nstate) or None
 
+        :param need_gradient: Whether to calculate the gradient or not.
+            If False, the returned grad_D is None unless need_laplacian is True.
+        :type need_gradient: bool
+
         :param need_laplacian: Whether to calculate the Laplacian or not
             If False, the returned lapl_D is None.
             Computing the Laplacian increases the memory footprint by an order
@@ -150,7 +284,7 @@ class MultistateMatrixDensity(torch.nn.Module, ABC):
             `D` - Tensor of shape (Nspin,Nspin,Ncoord,Nstate,Nstate),
                 blocks of spin matrix density Dᵅᵅᵢⱼ(r),Dᵅᵝᵢⱼ(r),Dᵝᵅᵢⱼ(r) and Dᵝᵝᵢⱼ(r)
                 D[s,t,r,i,j] = Dˢᵗᵢⱼ(coord[r,:])
-            `grad_D` - Tensor of shape (Nspin,Nspin,Ncoord,3,Nstate,Nstate)
+            `grad_D` - Tensor of shape (Nspin,Nspin,Ncoord,3,Nstate,Nstate) or None
                 gradient of spin matrix density,
                 grad_D[s,t,r,a,i,j] = ∇ₐDˢᵗᵢⱼ(coord[r,:]) with a = 0(x),1(y),2(z)
                 and s,t=0(up),1(down)
@@ -163,34 +297,105 @@ class MultistateMatrixDensity(torch.nn.Module, ABC):
             # and transition states (i != j) Dˢᵗᵦᵧᵢⱼ
             dm_ao = self.density_matrices_ao()
 
+        need_gradient = need_gradient or need_laplacian
+        if need_laplacian:
+            deriv = 2
+        elif need_gradient:
+            deriv = 1
+        else:
+            deriv = 0
+
         # Evaluate atomic orbitals 𝛘ₐ(r) on the grid using pyscf
-        # The orbital values and their gradients and Laplacian are returned in a single
-        # array of shape (10,ncoord,nbasis).
-        ao_value_all = numint.eval_ao(self.mol, coords, deriv=2)
+        # Only request derivatives needed by the active functionals.
+        ao_value_all = numint.eval_ao(self.mol, coords, deriv=deriv)
 
         # Convert numpy arrays to torch Tensors
         ao_value_all = torch.from_numpy(ao_value_all).to(
             dtype=dm_ao.dtype, device=dm_ao.device)
-        # value AO(r)
-        ao_value = ao_value_all[0,:,:]
-        # gradient d(AO)/dx, d(AO)/dy, d(AO)/dz
-        grad_ao_value = ao_value_all[1:4,:,:]
+        if deriv == 0:
+            # value AO(r)
+            ao_value = ao_value_all
+            grad_ao_value = None
+            lapl_ao_value = None
+        else:
+            # value AO(r)
+            ao_value = ao_value_all[0,:,:]
+            # gradient d(AO)/dx, d(AO)/dy, d(AO)/dz
+            grad_ao_value = ao_value_all[1:4,:,:]
+            if need_laplacian:
+                # Laplacian ∇²(AO)(r) = d^2(AO)/dx^2 + d^2(AO)/dy^2 + d^2(AO)/dz^2
+                lapl_ao_value = ao_value_all[4,:,:] + ao_value_all[7,:,:] + ao_value_all[9,:,:]
+            else:
+                lapl_ao_value = None
+
+        batch = AOGridBatch(
+            weights=None,
+            ao_value=ao_value,
+            grad_ao_value=grad_ao_value,
+            lapl_ao_value=lapl_ao_value,
+        )
+        return self.evaluate_from_ao_batch(
+            batch,
+            dm_ao=dm_ao,
+            need_gradient=need_gradient,
+            need_laplacian=need_laplacian,
+        )
+
+    def evaluate_from_ao_batch(
+        self,
+        batch: AOGridBatch,
+        dm_ao: Tensor = None,
+        need_gradient=True,
+        need_laplacian=True
+    ):
+        """
+        evaluate the multistate spin matrix density from cached AO grid data.
+
+        :param batch: AO values and optional derivatives for one grid chunk.
+        :type batch: AOGridBatch
+
+        :param dm_ao: state and transition density matrices in the AO basis.
+            If None, they are computed from the current matrix-density parameters.
+        :type dm_ao: Tensor of shape (2,2,Nbasis,Nbasis,Nstate,Nstate) or None
+
+        :param need_gradient: Whether to calculate the gradient or not.
+        :type need_gradient: bool
+
+        :param need_laplacian: Whether to calculate the Laplacian or not.
+        :type need_laplacian: bool
+
+        :return: D, grad_D, lapl_D
+        :rtype: tuple of Tensor
+        """
+        if dm_ao is None:
+            dm_ao = self.density_matrices_ao()
+
+        need_gradient = need_gradient or need_laplacian
+        ao_value = batch.ao_value
+        grad_ao_value = batch.grad_ao_value
+        lapl_ao_value = batch.lapl_ao_value
 
         # (transition) density in AO basis
         # Dˢᵗᵢⱼ(r) = ∑ᵦ ∑ᵧ Dˢᵗᵦᵧᵢⱼ 𝛘ᵦ(r) 𝛘ᵧ(r)
         D = torch.einsum(
             'stabij,ra,rb->strij', dm_ao, ao_value, ao_value
         )
-        # gradients of (transition) density
-        # ∇Dˢᵗᵢⱼ(r) = ∑ᵦ ∑ᵧ Dˢᵗᵦᵧᵢⱼ ∇𝛘ᵦ(r) 𝛘ᵧ(r) + Dˢᵗᵦᵧᵢⱼ 𝛘ᵦ(r) ∇𝛘ᵧ(r))
-        grad_D = (
-            torch.einsum('stabij,gra,rb->strgij', dm_ao, grad_ao_value, ao_value) +
-            torch.einsum('stabij,ra,grb->strgij', dm_ao, ao_value, grad_ao_value)
-        )
+
+        if need_gradient:
+            if grad_ao_value is None:
+                raise ValueError("AO gradients are required but missing from the AO grid batch.")
+            # gradients of (transition) density
+            # ∇Dˢᵗᵢⱼ(r) = ∑ᵦ ∑ᵧ Dˢᵗᵦᵧᵢⱼ ∇𝛘ᵦ(r) 𝛘ᵧ(r) + Dˢᵗᵦᵧᵢⱼ 𝛘ᵦ(r) ∇𝛘ᵧ(r))
+            grad_D = (
+                torch.einsum('stabij,gra,rb->strgij', dm_ao, grad_ao_value, ao_value) +
+                torch.einsum('stabij,ra,grb->strgij', dm_ao, ao_value, grad_ao_value)
+            )
+        else:
+            grad_D = None
 
         if need_laplacian:
-            # Laplacian ∇²(AO)(r) = d^2(AO)/dx^2 + d^2(AO)/dy^2 + d^2(AO)/dz^2
-            lapl_ao_value = ao_value_all[4,:,:] + ao_value_all[7,:,:] + ao_value_all[9,:,:]
+            if lapl_ao_value is None or grad_ao_value is None:
+                raise ValueError("AO first and second derivatives are required for the Laplacian.")
             # Laplacian of (transition) density
             # ∇²Dˢᵗ(r) = ∑ᵦ ∑ᵧ Dˢᵗᵦᵧᵢⱼ [ (∇²𝛘ᵦ)(𝛘ᵧ) + 2 (∇𝛘ᵦ)·(∇𝛘ᵧ) + (𝛘ᵦ)(∇²𝛘ᵧ) ]
             lapl_D = (
@@ -245,6 +450,34 @@ def antisymmetric_matrix(elements: Tensor, n: int) -> Tensor:
     A[cols,rows] = -elements
 
     return A
+
+
+def stiefel_tangent_block_matrix(block: Tensor, n: int, k: int) -> Tensor:
+    """
+    Construct a target/external anti-symmetric Stiefel tangent block matrix.
+
+    The input block A has shape (n-k,k) and defines
+
+        Omega(A) = [[0, -A.T], [A, 0]].
+
+    :param block: rectangular target/external mixing block
+    :type block: Tensor of shape (n-k,k)
+    :param n: full CSF-space dimension
+    :type n: int
+    :param k: target-state subspace dimension
+    :type k: int
+    :return omega: anti-symmetric tangent matrix
+    :rtype omega: Tensor of shape (n,n)
+    """
+    expected_size = Size([n-k, k])
+    if block.size() != expected_size:
+        raise ValueError(
+            f"Stiefel tangent block must have size {expected_size}, got {block.size()}."
+        )
+    omega = torch.zeros(n, n, dtype=block.dtype, device=block.device)
+    omega[:k, k:] = -block.T
+    omega[k:, :k] = block
+    return omega
 
 
 def orbital_guess(mol: pyscf.gto.Mole, guess="random", seed=None) -> numpy.ndarray:
@@ -307,6 +540,73 @@ def orbital_guess(mol: pyscf.gto.Mole, guess="random", seed=None) -> numpy.ndarr
         raise ValueError(f"Initial guess must be str or 2D numpy.ndarray, got {guess}")
 
     return mo_coeff
+
+
+def _active_space_for_spin_type(norb: int, nelec: int, spin_type=SpinType.UNPOLARIZED, max_level=numpy.inf) -> ActiveSpace:
+    if spin_type in [SpinType.INVARIANT, SpinType.INVARIANT_MIX, SpinType.NONCOLLINEAR]:
+        return ActiveSpace(norb, nelec, max_level=max_level, spin_range=None)
+    neleca, nelecb = _unpack_nelec(nelec)
+    spin = neleca - nelecb
+    return ActiveSpace(norb, nelec, max_level=max_level, spin_range=[spin])
+
+
+def _selected_spin_indices(mol: pyscf.gto.Mole, s2_eigvals: numpy.ndarray, spin_symmetry: bool, norb: int, nelec: int) -> numpy.ndarray:
+    ndet = len(s2_eigvals)
+    if ndet == 0:
+        raise ActiveSpaceError(
+            f"Active space (norb={norb}, nelec={nelec}) is empty, "
+            "check that neleca,nelecb <= norb."
+        )
+    if not spin_symmetry:
+        return numpy.arange(0, ndet)
+
+    s_target = mol.spin / 2
+    selected = [
+        i_spin for i_spin, s2 in enumerate(s2_eigvals)
+        if numpy.round(s2, decimals=2) == s_target * (s_target + 1)
+    ]
+    if not selected:
+        raise ActiveSpaceError(
+            f"There are no states with total spin <S²>=S(S+1)={s_target*(s_target+1)} "
+            f"in the active space (norb={norb}, nelec={nelec}). "
+            f"Eigenvalues of S² = {s2_eigvals}"
+        )
+    return numpy.array(selected)
+
+
+def cas_guess_components(
+    mol: pyscf.gto.Mole,
+    norb: int,
+    nelec: int,
+    spin_symmetry=True,
+    spin_type=SpinType.UNPOLARIZED,
+    max_level=numpy.inf,
+    guess='hcore',
+    seed=None,
+) -> CASGuessComponents:
+    mo_coeff = orbital_guess(mol, guess=guess, seed=seed)
+    orbital_coefficients = torch.from_numpy(mo_coeff).to(dtype=torch.double)
+    _, nmo = mo_coeff.shape
+    nrot_mo = (nmo * (nmo - 1)) // 2
+    orbital_rotation_params = torch.nn.Parameter(
+        data=torch.zeros(nrot_mo, dtype=torch.double), requires_grad=True)
+
+    active_space = _active_space_for_spin_type(norb, nelec, spin_type=spin_type, max_level=max_level)
+    s2_matrix_np = active_space.total_spin_matrix()
+    s2_eigvals, s2_eigvecs = numpy.linalg.eigh(s2_matrix_np)
+    selected = _selected_spin_indices(mol, s2_eigvals, spin_symmetry, norb, nelec)
+    det_to_csf = torch.from_numpy(s2_eigvecs[:, selected]).to(dtype=torch.double)
+    s2_matrix = torch.from_numpy(s2_matrix_np).to(dtype=torch.double)
+
+    return CASGuessComponents(
+        orbital_coefficients=orbital_coefficients,
+        orbital_rotation_params=orbital_rotation_params,
+        active_space=active_space,
+        s2_matrix=s2_matrix,
+        det_to_csf=det_to_csf,
+        nstate=len(selected),
+        ndet=len(s2_eigvals),
+    )
 
 
 def reorder_active_orbitals(mol: pyscf.gto.Mole, mo_coeff, active_orbitals: list, nelecas: int):
@@ -649,7 +949,7 @@ class MultistateMatrixDensityCAS(MultistateMatrixDensity):
             data=torch.zeros(nrot_mo).to(dtype=torch.double), requires_grad=True)
 
         # Active space defines which Slater determinants are included in subspace.
-        if spin_type in [SpinType.INVARIANT, SpinType.INVARIANT_MIX]:
+        if spin_type in [SpinType.INVARIANT, SpinType.INVARIANT_MIX, SpinType.NONCOLLINEAR]:
             # Include Slater determinants with all possible spin projections.
             # This is needed to make the subspace invariant to spatial rotations,
             # which mix states with different Sz values.
@@ -817,7 +1117,7 @@ class MultistateMatrixDensityCAS(MultistateMatrixDensity):
         self.spin_type = spin_type
         neleca, nelecb = _unpack_nelec(nelec)
         nelec = neleca+nelecb
-        if spin_type in [SpinType.INVARIANT, SpinType.INVARIANT_MIX]:
+        if spin_type in [SpinType.INVARIANT, SpinType.INVARIANT_MIX, SpinType.NONCOLLINEAR]:
             # Include Slater determinants with all possible spin projections.
             # This is needed to make the subspace invariant to spatial rotations,
             # which mix states with different Sz values.
@@ -1178,3 +1478,619 @@ class MultistateMatrixDensityCAS(MultistateMatrixDensity):
         # replace Dᵢⱼ(r) by Dᵢᵢ(r) δᵢⱼ
         self.register_buffer("dm_mo_spin", self.dm_mo_spin * identity)
         self.dm_mo_spin.requires_grad_(False)
+
+
+class TargetStateMultistateMatrixDensityCAS(MultistateMatrixDensity):
+    RESTART_SCHEMA_VERSION = 2
+    TARGET_PARAMETERIZATION_FULL_ROTATION = "full_rotation"
+    TARGET_PARAMETERIZATION_STIEFEL_K = "stiefel_k"
+    TARGET_PARAMETERIZATIONS = {
+        TARGET_PARAMETERIZATION_FULL_ROTATION,
+        TARGET_PARAMETERIZATION_STIEFEL_K,
+    }
+
+    """
+    Target-state CAS matrix density with K states embedded in a larger CSF basis.
+
+    The target-state coefficients are the first K columns of an orthogonal rotation
+    in the selected CSF basis.  This keeps C_target.T @ C_target = I by construction
+    while making `number_of_states` independent of the full CSF dimension.
+    """
+    @staticmethod
+    def from_guess(
+        mol: pyscf.gto.Mole,
+        norb: int,
+        nelec: int,
+        target_states: int,
+        spin_symmetry=True,
+        spin_type=SpinType.UNPOLARIZED,
+        max_level=numpy.inf,
+        guess='hcore',
+        seed=None,
+        target_parameterization=TARGET_PARAMETERIZATION_FULL_ROTATION,
+    ):
+        components = cas_guess_components(
+            mol,
+            norb,
+            nelec,
+            spin_symmetry=spin_symmetry,
+            spin_type=spin_type,
+            max_level=max_level,
+            guess=guess,
+            seed=seed,
+        )
+        if target_states < 1 or target_states > components.nstate:
+            raise ActiveSpaceError(
+                "`target_states` must be between 1 and the selected CSF dimension "
+                f"({components.nstate}), got {target_states}."
+            )
+
+        return TargetStateMultistateMatrixDensityCAS(
+            mol,
+            norb,
+            nelec,
+            target_states,
+            components.orbital_coefficients,
+            components.orbital_rotation_params,
+            components.det_to_csf,
+            components.s2_matrix,
+            components.active_space,
+            spin_symmetry=spin_symmetry,
+            spin_type=spin_type,
+            target_parameterization=target_parameterization,
+        )
+
+    def __init__(
+        self,
+        mol: pyscf.gto.Mole,
+        norb: int,
+        nelec: int,
+        target_states: int,
+        orbital_coefficients: Tensor,
+        orbital_rotation_params: torch.nn.Parameter,
+        det_to_csf: Tensor,
+        s2_matrix: Tensor,
+        active_space: ActiveSpace,
+        spin_symmetry=True,
+        spin_type=SpinType.UNPOLARIZED,
+        target_rotation_params: torch.nn.Parameter = None,
+        target_parameterization: str = TARGET_PARAMETERIZATION_FULL_ROTATION,
+        orthonormality_threshold: float = 1.0e-8,
+        spin_mixing_threshold: float = 1.0e-8,
+    ):
+        super().__init__(mol)
+        if target_parameterization not in self.TARGET_PARAMETERIZATIONS:
+            raise ValueError(
+                "`target_parameterization` must be 'full_rotation' or 'stiefel_k', "
+                f"got {target_parameterization!r}."
+            )
+        self.nao, self.nmo = orbital_coefficients.size()
+        self.nspin = 2
+        self.norb = norb
+        self.nelec = nelec
+        self.ntarget = target_states
+        self.spin_symmetry = spin_symmetry
+        self.spin_type = spin_type
+        self.target_parameterization = target_parameterization
+        self.active_space = active_space
+        self.orthonormality_threshold = orthonormality_threshold
+        self.spin_mixing_threshold = spin_mixing_threshold
+
+        neleca, nelecb = _unpack_nelec(nelec)
+        self.ndouble = (mol.tot_electrons() - (neleca + nelecb)) // 2
+        if self.ndouble < 0 or norb > self.nmo - self.ndouble:
+            raise ActiveSpaceError("Active-space electron/orbital count is incompatible with the molecule.")
+
+        self.register_buffer("mo_coeff_guess", orbital_coefficients.detach())
+        self.mo_coeff_guess.requires_grad_(False)
+
+        nrot_mo = (self.nmo * (self.nmo - 1)) // 2
+        self.orbital_rotation_params = self._check_input(
+            orbital_rotation_params,
+            name='orbital_rotation_params',
+            expected_size=Size([nrot_mo]),
+        )
+
+        self.register_buffer("det_to_csf", det_to_csf.detach())
+        self.det_to_csf.requires_grad_(False)
+        self.register_buffer("s2_matrix", s2_matrix.detach())
+        self.s2_matrix.requires_grad_(False)
+        self.ndet, self.ncsf = self.det_to_csf.size()
+        if target_states < 1 or target_states > self.ncsf:
+            raise ActiveSpaceError(
+                f"`target_states` must be in [1, {self.ncsf}], got {target_states}."
+            )
+
+        if target_rotation_params is None:
+            target_rotation_params = torch.nn.Parameter(
+                data=torch.zeros(
+                    self._target_parameter_size(),
+                    dtype=orbital_coefficients.dtype,
+                    device=orbital_coefficients.device,
+                ),
+                requires_grad=True,
+            )
+        self.target_rotation_params = self._check_input(
+            target_rotation_params,
+            name='target_rotation_params',
+            expected_size=self._target_parameter_size(),
+        )
+
+        table = self._build_one_body_operator_table(dtype=orbital_coefficients.dtype)
+        self.register_buffer("one_body_spin_rows", table.spin_rows)
+        self.register_buffer("one_body_spin_cols", table.spin_cols)
+        self.register_buffer("one_body_orbital_rows", table.orbital_rows)
+        self.register_buffer("one_body_orbital_cols", table.orbital_cols)
+        self.register_buffer("one_body_det_rows", table.det_rows)
+        self.register_buffer("one_body_det_cols", table.det_cols)
+        self.register_buffer("one_body_values", table.values)
+        self.one_body_shape = table.shape
+        two_body_table = self._build_two_body_operator_table(dtype=orbital_coefficients.dtype)
+        self.register_buffer("two_body_spin_rows", two_body_table.spin_rows)
+        self.register_buffer("two_body_spin_cols", two_body_table.spin_cols)
+        self.register_buffer("two_body_orbital_rows", two_body_table.orbital_rows)
+        self.register_buffer("two_body_orbital_cols", two_body_table.orbital_cols)
+        self.register_buffer("two_body_orbital_annihilate_rows", two_body_table.orbital_annihilate_rows)
+        self.register_buffer("two_body_orbital_annihilate_cols", two_body_table.orbital_annihilate_cols)
+        self.register_buffer("two_body_det_rows", two_body_table.det_rows)
+        self.register_buffer("two_body_det_cols", two_body_table.det_cols)
+        self.register_buffer("two_body_values", two_body_table.values)
+        self.two_body_shape = two_body_table.shape
+        self._last_orbital_grid_density = None
+        self.check_invariants(fail=True)
+
+    @property
+    def number_of_states(self):
+        return self.ntarget
+
+    @property
+    def number_of_determinants(self):
+        return self.ndet
+
+    @property
+    def number_of_csfs(self):
+        return self.ncsf
+
+    def _target_parameter_size(self):
+        if self.target_parameterization == self.TARGET_PARAMETERIZATION_FULL_ROTATION:
+            return Size([(self.ncsf * (self.ncsf - 1)) // 2])
+        if self.target_parameterization == self.TARGET_PARAMETERIZATION_STIEFEL_K:
+            return Size([self.ncsf - self.ntarget, self.ntarget])
+        raise RuntimeError(f"Unknown target parameterization {self.target_parameterization!r}.")
+
+    def _new_zero_target_params(self):
+        return torch.nn.Parameter(
+            data=torch.zeros(
+                self._target_parameter_size(),
+                dtype=self.target_rotation_params.dtype,
+                device=self.target_rotation_params.device,
+            ),
+            requires_grad=True,
+        )
+
+    def _build_one_body_operator_table(self, dtype: torch.dtype) -> OneBodyOperatorTable:
+        entries = []
+        determinants = self.active_space.slater_determinants()
+        determinant_indices = {det: index for index, det in enumerate(determinants)}
+        for ket, det_ket in enumerate(determinants):
+            for s in range(self.nspin):
+                for t in range(self.nspin):
+                    for p in range(self.norb):
+                        for q in range(self.norb):
+                            result = _apply_one_body_operator(det_ket, s, t, p, q, self.norb)
+                            if result is None:
+                                continue
+                            det_bra, value = result
+                            bra = determinant_indices.get(det_bra)
+                            if bra is None:
+                                continue
+                            entries.append((s, t, self.ndouble + q, self.ndouble + p, bra, ket, value))
+
+        for imo in range(self.ndouble):
+            for det in range(self.ndet):
+                for spin in range(self.nspin):
+                    entries.append((spin, spin, imo, imo, det, det, 1.0))
+
+        if entries:
+            data = numpy.array(entries, dtype=numpy.float64)
+            spin_rows = torch.from_numpy(data[:, 0].astype(numpy.int64))
+            spin_cols = torch.from_numpy(data[:, 1].astype(numpy.int64))
+            orbital_rows = torch.from_numpy(data[:, 2].astype(numpy.int64))
+            orbital_cols = torch.from_numpy(data[:, 3].astype(numpy.int64))
+            det_rows = torch.from_numpy(data[:, 4].astype(numpy.int64))
+            det_cols = torch.from_numpy(data[:, 5].astype(numpy.int64))
+            values = torch.from_numpy(data[:, 6]).to(dtype=dtype)
+        else:
+            spin_rows = torch.empty(0, dtype=torch.long)
+            spin_cols = torch.empty(0, dtype=torch.long)
+            orbital_rows = torch.empty(0, dtype=torch.long)
+            orbital_cols = torch.empty(0, dtype=torch.long)
+            det_rows = torch.empty(0, dtype=torch.long)
+            det_cols = torch.empty(0, dtype=torch.long)
+            values = torch.empty(0, dtype=dtype)
+
+        return OneBodyOperatorTable(
+            spin_rows=spin_rows,
+            spin_cols=spin_cols,
+            orbital_rows=orbital_rows,
+            orbital_cols=orbital_cols,
+            det_rows=det_rows,
+            det_cols=det_cols,
+            values=values,
+            shape=(self.nspin, self.nspin, self.nmo, self.nmo, self.ndet, self.ndet),
+        )
+
+    def _build_two_body_operator_table(self, dtype: torch.dtype) -> TwoBodyOperatorTable:
+        """Build sparse matrices for spin-conserving two-body operators.
+
+        The active-space determinants are embedded into the full MO space by
+        adding the doubly occupied core orbitals.  This keeps core--active and
+        core--core long-range contributions in the same differentiable
+        contraction as the active-space contribution.
+        """
+        active_determinants = self.active_space.slater_determinants()
+        core_mask = 0
+        for orbital in range(self.ndouble):
+            core_mask |= (1 << orbital) | (1 << (self.nmo + orbital))
+        determinants = [int(det) | core_mask for det in active_determinants]
+        determinant_indices = {det: index for index, det in enumerate(determinants)}
+        entries = []
+        for ket, det_ket in enumerate(determinants):
+            for spin_a in range(self.nspin):
+                for spin_b in range(self.nspin):
+                    for p in range(self.nmo):
+                        for q in range(self.nmo):
+                            for r in range(self.nmo):
+                                for s in range(self.nmo):
+                                    result = _apply_two_body_operator(
+                                        det_ket, spin_a, spin_b, p, q, r, s, self.nmo
+                                    )
+                                    if result is None:
+                                        continue
+                                    det_bra, value = result
+                                    bra = determinant_indices.get(det_bra)
+                                    if bra is None:
+                                        continue
+                                    entries.append((spin_a, spin_b, p, q, r, s, bra, ket, value))
+
+        if entries:
+            data = numpy.array(entries, dtype=numpy.float64)
+            spin_rows = torch.from_numpy(data[:, 0].astype(numpy.int64))
+            spin_cols = torch.from_numpy(data[:, 1].astype(numpy.int64))
+            orbital_rows = torch.from_numpy(data[:, 2].astype(numpy.int64))
+            orbital_cols = torch.from_numpy(data[:, 3].astype(numpy.int64))
+            orbital_annihilate_rows = torch.from_numpy(data[:, 4].astype(numpy.int64))
+            orbital_annihilate_cols = torch.from_numpy(data[:, 5].astype(numpy.int64))
+            det_rows = torch.from_numpy(data[:, 6].astype(numpy.int64))
+            det_cols = torch.from_numpy(data[:, 7].astype(numpy.int64))
+            values = torch.from_numpy(data[:, 8]).to(dtype=dtype)
+        else:
+            empty = torch.empty(0, dtype=torch.long)
+            spin_rows = empty.clone()
+            spin_cols = empty.clone()
+            orbital_rows = empty.clone()
+            orbital_cols = empty.clone()
+            orbital_annihilate_rows = empty.clone()
+            orbital_annihilate_cols = empty.clone()
+            det_rows = empty.clone()
+            det_cols = empty.clone()
+            values = torch.empty(0, dtype=dtype)
+
+        return TwoBodyOperatorTable(
+            spin_rows=spin_rows,
+            spin_cols=spin_cols,
+            orbital_rows=orbital_rows,
+            orbital_cols=orbital_cols,
+            orbital_annihilate_rows=orbital_annihilate_rows,
+            orbital_annihilate_cols=orbital_annihilate_cols,
+            det_rows=det_rows,
+            det_cols=det_cols,
+            values=values,
+            shape=(self.nspin, self.nspin, self.nmo, self.nmo, self.nmo, self.nmo, self.ndet, self.ndet),
+        )
+
+    def orbital_coefficients(self):
+        R_mo = antisymmetric_matrix(self.orbital_rotation_params, self.nmo)
+        U_mo = torch.matrix_exp(R_mo)
+        return self.mo_coeff_guess @ U_mo
+
+    def target_coefficients(self):
+        if self.target_parameterization == self.TARGET_PARAMETERIZATION_FULL_ROTATION:
+            return self._target_coefficients_full_rotation()
+        if self.target_parameterization == self.TARGET_PARAMETERIZATION_STIEFEL_K:
+            return self._target_coefficients_stiefel_k()
+        raise RuntimeError(f"Unknown target parameterization {self.target_parameterization!r}.")
+
+    def _target_coefficients_full_rotation(self):
+        R_target = antisymmetric_matrix(self.target_rotation_params, self.ncsf)
+        U_target = torch.matrix_exp(R_target)
+        return U_target[:, :self.ntarget]
+
+    def _target_coefficients_stiefel_k(self):
+        R_target = stiefel_tangent_block_matrix(
+            self.target_rotation_params, self.ncsf, self.ntarget)
+        U_target = torch.matrix_exp(R_target)
+        return U_target[:, :self.ntarget]
+
+    def determinant_coefficients(self):
+        return self.det_to_csf @ self.target_coefficients()
+
+    def target_orthonormality_error(self) -> Tensor:
+        coeff = self.target_coefficients()
+        identity = torch.eye(self.ntarget, dtype=coeff.dtype, device=coeff.device)
+        return torch.linalg.norm(coeff.T @ coeff - identity)
+
+    def orbital_orthonormality_error(self) -> Tensor:
+        coeff = self.orbital_coefficients()
+        overlap = torch.from_numpy(self.mol.intor_symmetric('int1e_ovlp')).to(
+            dtype=coeff.dtype, device=coeff.device)
+        identity = torch.eye(self.nmo, dtype=coeff.dtype, device=coeff.device)
+        return torch.linalg.norm(coeff.T @ overlap @ coeff - identity)
+
+    def invariant_diagnostics(self) -> dict:
+        s2 = self.spin_s2_expectation().detach()
+        return {
+            "target_orthonormality_error": float(self.target_orthonormality_error().detach().cpu()),
+            "orbital_orthonormality_error": float(self.orbital_orthonormality_error().detach().cpu()),
+            "spin_s2_min": float(torch.min(s2).cpu()),
+            "spin_s2_max": float(torch.max(s2).cpu()),
+        }
+
+    def state_diagnostics(self, reference_target_coefficients: Tensor = None, dominant_count: int = 5) -> dict:
+        coeff = self.target_coefficients().detach()
+        s2 = self.spin_s2_expectation().detach()
+        diagnostics = {
+            "spin_s2": [float(value) for value in s2.cpu()],
+            "spin_multiplicity": [int(value) for value in self.spin_multiplicity().detach().cpu()],
+            "dominant_csfs": [],
+        }
+        nitems = min(dominant_count, self.ncsf)
+        for istate in range(self.ntarget):
+            weights = coeff[:, istate].square()
+            values, indices = torch.topk(weights, k=nitems)
+            diagnostics["dominant_csfs"].append([
+                {
+                    "csf_index": int(index),
+                    "weight": float(value),
+                    "label": f"CSF {int(index)}",
+                }
+                for value, index in zip(values.cpu(), indices.cpu())
+            ])
+        if reference_target_coefficients is not None:
+            reference = reference_target_coefficients.detach().to(dtype=coeff.dtype, device=coeff.device)
+            diagnostics["reference_overlap"] = (reference.T @ coeff).cpu().tolist()
+            diagnostics["reference_overlap_abs"] = torch.abs(reference.T @ coeff).cpu().tolist()
+        return diagnostics
+
+    def check_invariants(self, fail: bool = True) -> dict:
+        diagnostics = self.invariant_diagnostics()
+        errors = []
+        if diagnostics["target_orthonormality_error"] > self.orthonormality_threshold:
+            errors.append(
+                "target coefficients are not orthonormal: "
+                f"{diagnostics['target_orthonormality_error']} > {self.orthonormality_threshold}"
+            )
+        if diagnostics["orbital_orthonormality_error"] > self.orthonormality_threshold:
+            errors.append(
+                "orbital coefficients are not orthonormal: "
+                f"{diagnostics['orbital_orthonormality_error']} > {self.orthonormality_threshold}"
+            )
+        if errors:
+            message = "; ".join(errors)
+            if fail:
+                raise RuntimeError(message)
+            warnings.warn(message)
+        return diagnostics
+
+    def warn_if_spin_mixed(self):
+        if not self.spin_symmetry or self.ntarget <= 1:
+            return None
+        coeff = self.determinant_coefficients()
+        s2_matrix = self.s2_matrix.to(dtype=coeff.dtype, device=coeff.device)
+        s2_target = coeff.T @ s2_matrix @ coeff
+        offdiag = s2_target - torch.diag(torch.diagonal(s2_target))
+        defect = torch.max(torch.abs(offdiag)).detach()
+        if defect > self.spin_mixing_threshold:
+            warnings.warn(
+                "Target-state coefficients mix spin sectors: off-diagonal S^2 defect "
+                f"{float(defect.cpu())} > {self.spin_mixing_threshold}",
+                RuntimeWarning,
+            )
+        return defect
+
+    def enforce_spin_symmetry(self):
+        defect = self.warn_if_spin_mixed()
+        if defect is not None and defect > self.spin_mixing_threshold:
+            raise RuntimeError(
+                "Target-state coefficients mix spin sectors: off-diagonal S^2 defect "
+                f"{float(defect.detach().cpu())} > {self.spin_mixing_threshold}"
+            )
+        return defect
+
+    def enforce_invariants(self):
+        diagnostics = self.check_invariants(fail=True)
+        self.enforce_spin_symmetry()
+        return diagnostics
+
+    def transition_1rdm_mo(self) -> Tensor:
+        coeff = self.determinant_coefficients()
+        entry_values = (
+            self.one_body_values.to(dtype=coeff.dtype, device=coeff.device).unsqueeze(-1).unsqueeze(-1) *
+            coeff[self.one_body_det_rows, :].unsqueeze(-1) *
+            coeff[self.one_body_det_cols, :].unsqueeze(-2)
+        )
+        gamma = torch.zeros(
+            (self.nspin, self.nspin, self.nmo, self.nmo, self.ntarget, self.ntarget),
+            dtype=coeff.dtype,
+            device=coeff.device,
+        )
+        gamma.index_put_(
+            (
+                self.one_body_spin_rows,
+                self.one_body_spin_cols,
+                self.one_body_orbital_rows,
+                self.one_body_orbital_cols,
+            ),
+            entry_values,
+            accumulate=True,
+        )
+        return gamma
+
+    def transition_2rdm_mo(self) -> Tensor:
+        """Return ``Gamma[stpqrs,I,J]=<I|a†_ps a†_qt a_ts a_rs|J>``.
+
+        The tensor uses the normal-ordered convention from the RS-LMDA
+        proposal.  It is deliberately generated from a sparse operator table,
+        so gradients flow through the live target-state coefficients while all
+        fermionic signs and frozen-core occupations remain fixed data.
+        """
+        coeff = self.determinant_coefficients()
+        entry_values = (
+            self.two_body_values.to(dtype=coeff.dtype, device=coeff.device).unsqueeze(-1).unsqueeze(-1) *
+            coeff[self.two_body_det_rows, :].unsqueeze(-1) *
+            coeff[self.two_body_det_cols, :].unsqueeze(-2)
+        )
+        gamma = torch.zeros(
+            self.two_body_shape[:6] + (self.ntarget, self.ntarget),
+            dtype=coeff.dtype,
+            device=coeff.device,
+        )
+        gamma.index_put_(
+            (
+                self.two_body_spin_rows,
+                self.two_body_spin_cols,
+                self.two_body_orbital_rows,
+                self.two_body_orbital_cols,
+                self.two_body_orbital_annihilate_rows,
+                self.two_body_orbital_annihilate_cols,
+            ),
+            entry_values,
+            accumulate=True,
+        )
+        return gamma
+
+    def density_matrices_ao(self) -> Tensor:
+        gamma_mo = self.transition_1rdm_mo()
+        mo_coeff = self.orbital_coefficients()
+        return torch.einsum('stpqij,ap,bq->stabij', gamma_mo, mo_coeff, mo_coeff)
+
+    def evaluate_from_mo_grid_batch(self, batch: AOGridBatch, gamma_mo: Tensor = None):
+        if batch.grad_ao_value is not None or batch.lapl_ao_value is not None:
+            raise NotImplementedError("MO-grid derivative evaluation is deferred beyond Stage 1.")
+        if gamma_mo is None:
+            gamma_mo = self.transition_1rdm_mo()
+        mo_value = batch.ao_value @ self.orbital_coefficients()
+        D = torch.einsum('stpqij,gp,gq->stgij', gamma_mo, mo_value, mo_value)
+        return D, None, None
+
+    def spin_s2_expectation(self):
+        ci_coeff_det = self.determinant_coefficients()
+        return torch.einsum('st,si,ti->i', self.s2_matrix, ci_coeff_det, ci_coeff_det)
+
+    def spin_multiplicity(self):
+        s2 = self.spin_s2_expectation()
+        multiplicity = torch.sqrt(1.0 + 4*s2)
+        return torch.round(multiplicity, decimals=0).int()
+
+    def state_weights(self):
+        sz = self.active_space.spin_projection_sz()
+        if len(numpy.unique(sz)) == 1:
+            return self.spin_multiplicity()
+        return torch.ones(self.ntarget, dtype=torch.int, device=self.target_rotation_params.device)
+
+    def basis_transformation(self, L: Tensor):
+        target_coeff = self.target_coefficients() @ L.T
+        q, _ = torch.linalg.qr(target_coeff.detach())
+        completion = torch.eye(self.ncsf, dtype=q.dtype, device=q.device)
+        completion[:, :self.ntarget] = q[:, :self.ntarget]
+        full_q, _ = torch.linalg.qr(completion)
+        self.register_buffer("det_to_csf", self.det_to_csf @ full_q)
+        self.target_rotation_params = self._new_zero_target_params()
+        self.check_invariants(fail=True)
+
+    def occupation_labels(self):
+        return self.active_space.occupation_labels()
+
+    def restart_state(self) -> dict:
+        return {
+            "schema_version": self.RESTART_SCHEMA_VERSION,
+            "class": self.__class__.__name__,
+            "norb": self.norb,
+            "nelec": self.nelec,
+            "target_states": self.ntarget,
+            "ncsf": self.ncsf,
+            "nmo": self.nmo,
+            "spin_symmetry": self.spin_symmetry,
+            "spin_type": self.spin_type.name,
+            "target_parameterization": self.target_parameterization,
+            "orthonormality_threshold": self.orthonormality_threshold,
+            "spin_mixing_threshold": self.spin_mixing_threshold,
+            "orbital_rotation_params": self.orbital_rotation_params.detach().cpu().clone(),
+            "target_rotation_params": self.target_rotation_params.detach().cpu().clone(),
+            "diagnostics": self.invariant_diagnostics(),
+        }
+
+    def _validate_restart_state(self, state: dict):
+        schema_version = state.get("schema_version")
+        if schema_version not in {1, self.RESTART_SCHEMA_VERSION}:
+            raise ValueError(
+                "Unsupported restart schema version: "
+                f"{schema_version} not in {{1, {self.RESTART_SCHEMA_VERSION}}}"
+            )
+        restart_parameterization = state.get(
+            "target_parameterization", self.TARGET_PARAMETERIZATION_FULL_ROTATION)
+        if restart_parameterization != self.target_parameterization:
+            raise ValueError(
+                "Restart target_parameterization does not match this object: "
+                f"{restart_parameterization} != {self.target_parameterization}."
+            )
+        expected = {
+            "target_states": self.ntarget,
+            "ncsf": self.ncsf,
+            "nmo": self.nmo,
+            "norb": self.norb,
+            "nelec": self.nelec,
+            "spin_symmetry": self.spin_symmetry,
+            "spin_type": self.spin_type.name,
+        }
+        for key, value in expected.items():
+            if state.get(key) != value:
+                raise ValueError(f"Restart {key} does not match this object: {state.get(key)} != {value}.")
+
+    def load_restart_state(self, state: dict):
+        if "schema_version" not in state:
+            if self.target_parameterization != self.TARGET_PARAMETERIZATION_FULL_ROTATION:
+                raise ValueError(
+                    "Legacy target-state restart files can only be loaded into "
+                    "target_parameterization='full_rotation'."
+                )
+            if state["target_states"] != self.ntarget:
+                raise ValueError("Restart target-state count does not match this object.")
+        else:
+            self._validate_restart_state(state)
+        with torch.no_grad():
+            self.orbital_rotation_params.copy_(state["orbital_rotation_params"].to(
+                dtype=self.orbital_rotation_params.dtype,
+                device=self.orbital_rotation_params.device,
+            ))
+            self.target_rotation_params.copy_(state["target_rotation_params"].to(
+                dtype=self.target_rotation_params.dtype,
+                device=self.target_rotation_params.device,
+            ))
+        self.enforce_invariants()
+
+    def save_restart_file(self, path):
+        path = Path(path)
+        state = self.restart_state()
+        serializable = dict(state)
+        serializable["orbital_rotation_params"] = state["orbital_rotation_params"].tolist()
+        serializable["target_rotation_params"] = state["target_rotation_params"].tolist()
+        path.write_text(json.dumps(serializable, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
+    def load_restart_file(self, path):
+        path = Path(path)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["orbital_rotation_params"] = torch.tensor(state["orbital_rotation_params"], dtype=torch.double)
+        state["target_rotation_params"] = torch.tensor(state["target_rotation_params"], dtype=torch.double)
+        self.load_restart_state(state)

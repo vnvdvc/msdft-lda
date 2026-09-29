@@ -1,3 +1,13 @@
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests/unit", "tests/integration", "tests/regression", "tests/scientific"]
+markers = [
+    "unit: fast, deterministic unit tests (no molecular calculations)",
+    "integration: PySCF-backed integration tests",
+    "regression: regression / invariance / performance tests",
+    "scientific: scientific release-gate benchmark tests",
+]

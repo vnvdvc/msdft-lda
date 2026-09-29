@@ -1,0 +1,233 @@
+# Canonical defaults for the robust compact multi-state reference protocol.
+# These are implementation defaults and benchmark-calibration starting points,
+# not universal physical constants. All resolved values must be serialized.
+
+schema_version: "1.0"
+profile: production
+seed: 20260818
+
+runtime:
+  dtype: float64
+  complex_enabled: true
+  deterministic: true
+  max_memory_mb: 8000
+  n_processes: 1
+  blas_threads_per_process: 1
+  checkpoint_every_iteration: true
+  fail_on_warning_categories:
+    - spin_contamination
+    - unresolved_root_tracking
+    - unresolved_orbital_alignment
+    - electron_count_mismatch
+
+backend:
+  name: pyscf
+  target_version_family: "2.14.x"
+  require_capabilities:
+    - state_average_mix
+    - make_rdm12
+    - trans_rdm1
+    - spin_square
+    - nonorthogonal_fci_overlap
+  allow_private_api: false
+  private_api_requires_guard: true
+
+teacher:
+  casscf_energy_tol_eh: 1.0e-9
+  casscf_grad_tol: 3.0e-5
+  max_macro_cycles: 100
+  max_micro_cycles: null
+  spin_penalty_shift_eh: 0.2
+  spin_square_abs_tol: 1.0e-5
+  state_weight_sum_tol: 1.0e-12
+  require_converged: true
+  canonicalize_after_casscf: false
+
+orbital_gauge:
+  mode: anchored_procrustes
+  preserve_symmetry_blocks: true
+  phase_fix: max_reference_overlap
+  orbital_match_min_sigma: 0.90
+  orbital_match_warn_sigma: 0.97
+  degeneracy_tie_tol: 1.0e-7
+  deterministic_tie_break:
+    - irrep
+    - anchor_label
+    - projected_center
+    - state_average_occupation
+    - original_index
+
+state_tracking:
+  cluster_mode: automatic_with_user_overrides
+  state_match_min_overlap: 0.50
+  state_match_ambiguity_tol: 0.05
+  cluster_gap_threshold_eh: 0.005
+  use_hungarian_assignment: true
+  use_procrustes_for_clusters: true
+  root_buffer: 2
+  max_root_buffer: 8
+  forbid_energy_only_fallback: true
+
+active_space_ensemble:
+  tier: fixed_orbital
+  n_active_spaces: 12
+  require_all_variants: true
+  minimum_success_fraction_development: 0.90
+  max_add_orbitals: 2
+  allow_remove: false
+  n_random_variants: 4
+  rotation_angle_rad: 0.05
+  preserve_symmetry_blocks: true
+  match_local_character: true
+  max_variant_active_orbitals: null
+  variant_weights: uniform
+
+teacher_ci_storage:
+  coefficient_io_screen: 1.0e-6
+  minimum_captured_norm_per_state: 0.999999
+  sparse_storage: true
+
+support_seed:
+  selection_unit: spatial_occupation_family
+  q_persistence_threshold: 1.0e-5
+  captured_average_weight: 0.995
+  minimum_captured_weight_per_state: 0.99
+  minimum_persistence_preference: 0.50
+  persistence_is_hard_filter: false
+  min_support_families: 1
+  protect_user_reference_families: true
+
+spin_completion:
+  enabled: true
+  mandatory: true
+  verify_after_each_solve: true
+  spin_square_abs_tol: 1.0e-5
+  max_determinant_expansion_factor_warn: 20.0
+  max_determinant_expansion_factor_fail: 200.0
+
+selected_solver:
+  reference_dense_max_determinants: 5000
+  explicit_sparse_max_determinants: 50000
+  eigensolver: auto
+  eig_tol_eh: 1.0e-10
+  eig_max_cycles: 100
+  eig_max_subspace: 30
+  eig_lindep: 1.0e-12
+  numerical_preconditioner_shift_eh: 1.0e-6
+  max_support_families: 2000
+  max_support_determinants: 20000
+  add_batch_size: 4
+  max_selection_iterations: 25
+
+static_leakage:
+  denominator_mode: en_diagonal
+  tau_static_max: 0.020
+  tau_static_rms: 0.030
+  delta_intruder_eh: 0.050
+  tau_coupling_eh: 1.0e-4
+  delta_numeric_eh: 1.0e-10
+  max_external_candidates: 2000000
+  external_prescreen_enabled: false
+  pt2_energy_used_for_selection: false
+  store_top_external_families: 100
+
+# Suggested calibration ranges. An automated run must NOT modify defaults from
+# these ranges without an explicit benchmark-calibration task.
+calibration_ranges:
+  teacher_ci_storage.coefficient_io_screen: [1.0e-8, 1.0e-4]
+  support_seed.q_persistence_threshold: [1.0e-7, 1.0e-3]
+  support_seed.captured_average_weight: [0.98, 0.9999]
+  support_seed.minimum_captured_weight_per_state: [0.95, 0.9999]
+  static_leakage.tau_static_max: [0.005, 0.05]
+  static_leakage.tau_static_rms: [0.01, 0.08]
+  static_leakage.delta_intruder_eh: [0.01, 0.10]
+  static_leakage.tau_coupling_eh: [1.0e-6, 1.0e-3]
+  acceptance.tau_projector: [0.005, 0.05]
+  acceptance.tau_gamma: [1.0e-4, 5.0e-3]
+  acceptance.tau_E_SA_eh: [1.0e-4, 2.0e-3]
+  active_space_ensemble.rotation_angle_rad: [0.01, 0.15]
+  active_space_ensemble.n_active_spaces: [6, 32]
+
+acceptance:
+  tau_projector: 0.020
+  tau_projector_frobenius: null
+  tau_gamma: 1.0e-3
+  tau_gamma_block_max: 3.0e-3
+  gamma_block_weighting: state_weight_product
+  tau_E_SA_eh: 5.0e-4
+  energy_is_mandatory: true
+  tau_excitation_gap_ev: 0.020
+  excitation_gap_is_mandatory: false
+  tau_family_hellinger: 0.050
+  family_distribution_is_mandatory: false
+  minimum_weighted_jaccard: 0.90
+  support_metric_is_mandatory: false
+  spin_is_mandatory: true
+  symmetry_is_mandatory: true
+  static_leakage_is_mandatory: true
+  compactness_is_mandatory: true
+  require_all_active_space_variants: true
+
+repair:
+  density_candidate_pool: 24
+  density_add_batch_size: 1
+  projector_candidate_pool: 24
+  projector_add_batch_size: 1
+  exact_trial_density_leverage: true
+  max_repair_rounds: 20
+
+pruning:
+  enabled: true
+  safety_factor: 0.90
+  exact_recheck: true
+  batch_removal: false
+  cache_trials: true
+
+metrics:
+  ao_metric: symmetric_orthogonal
+  matrix_rdm_norm: frobenius
+  matrix_rdm_normalize_by_electrons: true
+  configuration_distance: hellinger
+  support_similarity: weighted_jaccard
+  report_pt2_tail: true
+  report_individual_state_overlaps: true
+  report_principal_angles: true
+
+io:
+  hdf5_schema_version: "1.0"
+  output_h5: reference.msref.h5
+  output_json: reference.msref.json
+  write_iteration_history: true
+  write_teacher_sparse_ci: true
+  store_mo_coefficients: true
+  store_ao_overlap: true
+  store_matrix_rdm: true
+  hash_major_arrays: true
+
+profiles:
+  development_overrides:
+    active_space_ensemble.require_all_variants: false
+    acceptance.require_all_active_space_variants: false
+    selected_solver.max_selection_iterations: 15
+  strict_overrides:
+    active_space_ensemble.n_active_spaces: 24
+    active_space_ensemble.n_random_variants: 8
+    acceptance.tau_projector: 0.010
+    acceptance.tau_gamma: 5.0e-4
+    static_leakage.tau_static_max: 0.010
+    static_leakage.tau_static_rms: 0.020
+    pruning.safety_factor: 0.80
+
+benchmark_caps:
+  h2:
+    max_support_families: 50
+    max_support_determinants: 500
+  n2:
+    max_support_families: 1000
+    max_support_determinants: 10000
+  o2:
+    max_support_families: 1000
+    max_support_determinants: 10000
+  c2:
+    max_support_families: 2000
+    max_support_determinants: 20000

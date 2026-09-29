@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import numpy
 import numpy.linalg as la
 import numpy.testing
+import tempfile
 import pyscf.dft
 
 import torch
@@ -13,12 +14,17 @@ import torch.linalg
 import torch.testing
 from tqdm import tqdm
 import unittest
+import warnings
+from unittest import mock
 
 from mlmsdft.dft.active_space import ActiveSpaceError
+from mlmsdft.dft.density import AOGridBatch
 from mlmsdft.dft.density import antisymmetric_matrix
 from mlmsdft.dft.density import MultistateMatrixDensity
 from mlmsdft.dft.density import MultistateMatrixDensityCAS
 from mlmsdft.dft.density import MultistateMatrixDensityKohnSham
+from mlmsdft.dft.density import TargetStateMultistateMatrixDensityCAS
+import mlmsdft.dft.density as density_mod
 from mlmsdft.dft.density import orbital_guess
 from mlmsdft.dft.density import reorder_active_orbitals
 from mlmsdft.dft.spin import SpinType
@@ -439,6 +445,71 @@ class TestMultistateMatrixDensityCAS(unittest.TestCase, BaseTestMultistateMatrix
             norb = 2
             nelec = 1
         return cls.create_random_matrix_density_cas(mol, norb, nelec, spin_symmetry=True)
+
+    def test_evaluate_derivative_flags(self):
+        """Check that evaluate requests only the AO derivatives it needs."""
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = self.create_random_matrix_density(mol)
+        coords = numpy.array([
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.2],
+            [-0.2, 0.3, 0.1],
+        ])
+
+        original_eval_ao = density_mod.numint.eval_ao
+
+        def eval_ao_spy(*args, **kwargs):
+            return original_eval_ao(*args, **kwargs)
+
+        with mock.patch.object(density_mod.numint, "eval_ao", side_effect=eval_ao_spy) as patched_eval_ao:
+            D0, grad_D0, lapl_D0 = msmd.evaluate(
+                coords, need_gradient=False, need_laplacian=False)
+            self.assertEqual(patched_eval_ao.call_args.kwargs["deriv"], 0)
+            self.assertIsNone(grad_D0)
+            self.assertIsNone(lapl_D0)
+
+            D1, grad_D1, lapl_D1 = msmd.evaluate(
+                coords, need_gradient=True, need_laplacian=False)
+            self.assertEqual(patched_eval_ao.call_args.kwargs["deriv"], 1)
+            self.assertIsNotNone(grad_D1)
+            self.assertIsNone(lapl_D1)
+
+            D2, grad_D2, lapl_D2 = msmd.evaluate(
+                coords, need_gradient=False, need_laplacian=True)
+            self.assertEqual(patched_eval_ao.call_args.kwargs["deriv"], 2)
+            self.assertIsNotNone(grad_D2)
+            self.assertIsNotNone(lapl_D2)
+
+        torch.testing.assert_close(D0, D1)
+        torch.testing.assert_close(D0, D2)
+
+    def test_evaluate_from_ao_batch(self):
+        """Check cached AO grid batches reproduce direct evaluate outputs."""
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = self.create_random_matrix_density(mol)
+        coords = numpy.array([
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.2],
+            [-0.2, 0.3, 0.1],
+        ])
+        dm_ao = msmd.density_matrices_ao()
+
+        ao_value_all = pyscf.dft.numint.eval_ao(mol, coords, deriv=2)
+        ao_value_all = torch.from_numpy(ao_value_all).to(dtype=dm_ao.dtype, device=dm_ao.device)
+        batch = AOGridBatch(
+            weights=None,
+            ao_value=ao_value_all[0,:,:],
+            grad_ao_value=ao_value_all[1:4,:,:],
+            lapl_ao_value=ao_value_all[4,:,:] + ao_value_all[7,:,:] + ao_value_all[9,:,:],
+        )
+
+        direct = msmd.evaluate(
+            coords, dm_ao=dm_ao, need_gradient=True, need_laplacian=True)
+        cached = msmd.evaluate_from_ao_batch(
+            batch, dm_ao=dm_ao, need_gradient=True, need_laplacian=True)
+
+        for direct_tensor, cached_tensor in zip(direct, cached):
+            torch.testing.assert_close(cached_tensor, direct_tensor)
 
     @classmethod
     def create_random_matrix_density_cas(
@@ -1055,6 +1126,467 @@ class TestMultistateMatrixDensityCAS(unittest.TestCase, BaseTestMultistateMatrix
                 numpy.testing.assert_allclose(mo_coeff[:,4], roks.mo_coeff[:,3], atol=1.0e-12)
                 # Check that new LUMO is old LUMO
                 numpy.testing.assert_allclose(mo_coeff[:,5], roks.mo_coeff[:,5], atol=1.0e-12)
+
+
+class TestTargetStateMultistateMatrixDensityCAS(unittest.TestCase, FixtureMixin):
+    """Stage 1 target-state CAS density tests."""
+
+    def test_h2_full_target_space_matches_dense_density_matrices_ao(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        dense = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=dense.number_of_states,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+
+        self.assertEqual(target.number_of_states, dense.number_of_states)
+        self.assertEqual(target.number_of_csfs, dense.number_of_states)
+        torch.testing.assert_close(target.density_matrices_ao(), dense.density_matrices_ao())
+
+    def test_sparse_gamma_matches_dense_csf_contraction_cas44(self):
+        mol = self.create_test_molecules()['lithium hydride']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, target_states=3,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+
+        with torch.no_grad():
+            target.target_rotation_params.copy_(torch.linspace(
+                -0.03, 0.04, target.target_rotation_params.numel(), dtype=torch.double))
+
+        dense = MultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        coeff = target.target_coefficients()
+        gamma_dense = torch.einsum('...st,si,tj->...ij', dense.dm_mo_spin, coeff, coeff)
+        gamma_sparse = target.transition_1rdm_mo()
+
+        torch.testing.assert_close(gamma_sparse, gamma_dense, rtol=1.0e-10, atol=1.0e-10)
+
+    def test_target_one_body_table_does_not_call_dense_matrix_density_mo(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        reference = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        with mock.patch.object(
+                density_mod.ActiveSpace,
+                "matrix_density_mo",
+                side_effect=AssertionError("dense matrix_density_mo should not be called")):
+            target = TargetStateMultistateMatrixDensityCAS(
+                mol, 2, 2, target_states=2,
+                orbital_coefficients=reference.orbital_coefficients(),
+                orbital_rotation_params=reference.orbital_rotation_params,
+                det_to_csf=reference.det_to_csf,
+                s2_matrix=reference.s2_matrix,
+                active_space=reference.active_space,
+                spin_symmetry=True,
+                spin_type=SpinType.UNPOLARIZED,
+            )
+
+        self.assertGreater(target.one_body_values.numel(), 0)
+        self.assertEqual(target.one_body_shape, (2, 2, target.nmo, target.nmo, target.ndet, target.ndet))
+
+    def test_target_from_guess_does_not_call_dense_from_guess(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        with mock.patch.object(
+                density_mod.MultistateMatrixDensityCAS,
+                "from_guess",
+                side_effect=AssertionError("target from_guess must not call dense from_guess")):
+            target = TargetStateMultistateMatrixDensityCAS.from_guess(
+                mol, 2, 2, target_states=2,
+                spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+
+        self.assertEqual(target.number_of_states, 2)
+        self.assertEqual(target.number_of_csfs, 2)
+        self.assertGreater(target.one_body_values.numel(), 0)
+
+    def test_target_direct_from_guess_matches_dense_spin_basis_small_system(self):
+        mol = self.create_test_molecules()['lithium hydride']
+        dense = MultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, target_states=3,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+
+        self.assertEqual(target.number_of_determinants, dense.number_of_determinants)
+        self.assertEqual(target.number_of_csfs, dense.number_of_states)
+        torch.testing.assert_close(target.det_to_csf, dense.det_to_csf)
+        torch.testing.assert_close(target.s2_matrix, dense.s2_matrix)
+        torch.testing.assert_close(target.orbital_coefficients(), dense.orbital_coefficients())
+
+    def test_sparse_gamma_matches_dense_all_spin_blocks_noncollinear(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=4,
+            spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess='hcore')
+
+        with torch.no_grad():
+            target.target_rotation_params.copy_(torch.linspace(
+                -0.04, 0.05, target.target_rotation_params.numel(), dtype=torch.double))
+
+        dense = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess='hcore')
+        coeff = target.target_coefficients()
+        gamma_dense = torch.einsum('...st,si,tj->...ij', dense.dm_mo_spin, coeff, coeff)
+        gamma_sparse = target.transition_1rdm_mo()
+
+        torch.testing.assert_close(gamma_sparse, gamma_dense, rtol=1.0e-10, atol=1.0e-10)
+
+    def test_mo_grid_density_matches_ao_grid_density(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        coords = numpy.array([
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.2],
+            [-0.2, 0.3, 0.1],
+        ])
+        ao_value = pyscf.dft.numint.eval_ao(mol, coords, deriv=0)
+        ao_value = torch.from_numpy(ao_value).to(dtype=torch.double)
+        batch = AOGridBatch(weights=None, ao_value=ao_value)
+
+        D_mo, grad_D_mo, lapl_D_mo = target.evaluate_from_mo_grid_batch(batch)
+        D_ao, grad_D_ao, lapl_D_ao = target.evaluate_from_ao_batch(
+            batch, need_gradient=False, need_laplacian=False)
+
+        torch.testing.assert_close(D_mo, D_ao, rtol=1.0e-10, atol=1.0e-10)
+        self.assertIsNone(grad_D_mo)
+        self.assertIsNone(lapl_D_mo)
+        self.assertIsNone(grad_D_ao)
+        self.assertIsNone(lapl_D_ao)
+
+    def test_noncollinear_target_density_uses_full_spin_block_space(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        dense = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess='hcore')
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess='hcore')
+
+        self.assertEqual(target.spin_type, SpinType.NONCOLLINEAR)
+        self.assertEqual(target.number_of_determinants, dense.ndet)
+        self.assertEqual(target.number_of_csfs, dense.number_of_states)
+        self.assertEqual(target.transition_1rdm_mo().size()[:4], Size([2, 2, target.nmo, target.nmo]))
+
+    def test_noncollinear_mo_grid_density_matches_ao_grid_density(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess='hcore')
+        coords = numpy.array([
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.2],
+            [-0.2, 0.3, 0.1],
+        ])
+        ao_value = pyscf.dft.numint.eval_ao(mol, coords, deriv=0)
+        ao_value = torch.from_numpy(ao_value).to(dtype=torch.double)
+        batch = AOGridBatch(weights=None, ao_value=ao_value)
+
+        D_mo, grad_D_mo, lapl_D_mo = target.evaluate_from_mo_grid_batch(batch)
+        D_ao, grad_D_ao, lapl_D_ao = target.evaluate_from_ao_batch(
+            batch, need_gradient=False, need_laplacian=False)
+
+        self.assertEqual(D_mo.size(), Size([2, 2, len(coords), target.number_of_states, target.number_of_states]))
+        torch.testing.assert_close(D_mo, D_ao, rtol=1.0e-10, atol=1.0e-10)
+        self.assertIsNone(grad_D_mo)
+        self.assertIsNone(lapl_D_mo)
+        self.assertIsNone(grad_D_ao)
+        self.assertIsNone(lapl_D_ao)
+
+    def test_target_density_autograd(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target0 = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        coords = numpy.array([[0.0, 0.0, 0.0], [0.2, -0.1, 0.1]])
+        ao_value = torch.from_numpy(pyscf.dft.numint.eval_ao(mol, coords, deriv=0)).to(dtype=torch.double)
+        batch = AOGridBatch(weights=None, ao_value=ao_value)
+
+        def wrapper_function(orbital_rotation_params, target_rotation_params):
+            target = TargetStateMultistateMatrixDensityCAS(
+                mol,
+                2,
+                2,
+                2,
+                target0.mo_coeff_guess,
+                orbital_rotation_params,
+                target0.det_to_csf,
+                target0.s2_matrix,
+                target0.active_space,
+                spin_symmetry=True,
+                spin_type=SpinType.UNPOLARIZED,
+                target_rotation_params=target_rotation_params,
+            )
+            D, _, _ = target.evaluate_from_mo_grid_batch(batch)
+            return D
+
+        orbital_rotation_params = random_tensor(target0.orbital_rotation_params.size())
+        orbital_rotation_params.requires_grad_(True)
+        target_rotation_params = random_tensor(target0.target_rotation_params.size())
+        target_rotation_params.requires_grad_(True)
+        gradcheck(wrapper_function, (orbital_rotation_params, target_rotation_params))
+
+    def test_target_and_orbital_orthonormality_invariants(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+
+        self.assertLess(target.target_orthonormality_error().item(), 1.0e-12)
+        self.assertLess(target.orbital_orthonormality_error().item(), 1.0e-10)
+        with torch.no_grad():
+            target.target_rotation_params.add_(torch.linspace(
+                -0.02, 0.03, target.target_rotation_params.numel(), dtype=torch.double))
+            target.orbital_rotation_params.add_(torch.linspace(
+                -0.01, 0.02, target.orbital_rotation_params.numel(), dtype=torch.double))
+        self.assertLess(target.target_orthonormality_error().item(), 1.0e-12)
+        self.assertLess(target.orbital_orthonormality_error().item(), 1.0e-10)
+
+    def test_mo_grid_evaluator_does_not_persist_orbital_pair_grid_density(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        coords = numpy.array([[0.0, 0.0, 0.0], [0.1, 0.2, 0.0]])
+        ao_value = torch.from_numpy(pyscf.dft.numint.eval_ao(mol, coords, deriv=0)).to(dtype=torch.double)
+        D, _, _ = target.evaluate_from_mo_grid_batch(AOGridBatch(weights=None, ao_value=ao_value))
+
+        self.assertEqual(D.size(), Size([2, 2, len(coords), target.number_of_states, target.number_of_states]))
+        self.assertIsNone(target._last_orbital_grid_density)
+        for name in vars(target):
+            self.assertNotIn('pqg', name.lower())
+            self.assertNotIn('orbital_pair_grid', name.lower())
+
+    def test_stage4_invariant_diagnostics_and_restart(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        with torch.no_grad():
+            target.target_rotation_params.add_(torch.linspace(
+                -0.02, 0.03, target.target_rotation_params.numel(), dtype=torch.double))
+            target.orbital_rotation_params.add_(torch.linspace(
+                -0.01, 0.02, target.orbital_rotation_params.numel(), dtype=torch.double))
+
+        diagnostics = target.check_invariants(fail=True)
+        self.assertLess(diagnostics['target_orthonormality_error'], 1.0e-10)
+        self.assertLess(diagnostics['orbital_orthonormality_error'], 1.0e-8)
+        state = target.restart_state()
+
+        restored = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        restored.load_restart_state(state)
+        torch.testing.assert_close(restored.target_rotation_params, target.target_rotation_params)
+        torch.testing.assert_close(restored.orbital_rotation_params, target.orbital_rotation_params)
+        self.assertLess(restored.check_invariants()['target_orthonormality_error'], 1.0e-10)
+
+    def test_versioned_restart_file_roundtrip_and_incompatibility_rejection(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        with torch.no_grad():
+            target.target_rotation_params.add_(torch.linspace(
+                -0.01, 0.02, target.target_rotation_params.numel(), dtype=torch.double))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            restart_path = f"{tmpdir}/target_restart.json"
+            target.save_restart_file(restart_path)
+            restored = TargetStateMultistateMatrixDensityCAS.from_guess(
+                mol, 2, 2, target_states=2,
+                spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+            restored.load_restart_file(restart_path)
+            torch.testing.assert_close(restored.target_rotation_params, target.target_rotation_params)
+
+            incompatible = restored.restart_state()
+            incompatible["target_states"] = 1
+            with self.assertRaises(ValueError):
+                restored.load_restart_state(incompatible)
+
+    def test_enforce_spin_symmetry_rejects_cross_spin_target_rotations(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=4,
+            spin_symmetry=False, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        target.spin_symmetry = True
+        with torch.no_grad():
+            target.target_rotation_params.add_(0.05)
+        with self.assertRaises(RuntimeError):
+            target.enforce_spin_symmetry()
+
+    def test_stage4_spin_mixing_warning_for_cross_spin_targets(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=4,
+            spin_symmetry=False, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        target.spin_symmetry = True
+        with torch.no_grad():
+            target.target_rotation_params.add_(0.05)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            defect = target.warn_if_spin_mixed()
+        self.assertIsNotNone(defect)
+        self.assertTrue(any('mix spin sectors' in str(item.message) for item in caught))
+
+    def test_state_diagnostics_reports_spin_dominant_csfs_and_root_overlap(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        reference = target.target_coefficients().detach().clone()
+        with torch.no_grad():
+            target.target_rotation_params.add_(torch.linspace(
+                -0.01, 0.02, target.target_rotation_params.numel(), dtype=torch.double))
+
+        diagnostics = target.state_diagnostics(reference_target_coefficients=reference, dominant_count=2)
+
+        self.assertEqual(len(diagnostics["spin_s2"]), target.number_of_states)
+        self.assertEqual(len(diagnostics["spin_multiplicity"]), target.number_of_states)
+        self.assertEqual(len(diagnostics["dominant_csfs"]), target.number_of_states)
+        self.assertEqual(len(diagnostics["dominant_csfs"][0]), 2)
+        self.assertEqual(len(diagnostics["reference_overlap_abs"]), target.number_of_states)
+        self.assertGreaterEqual(diagnostics["dominant_csfs"][0][0]["weight"], 0.0)
+
+    def test_restart_resume_preserves_hamiltonian_and_diagnostics(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        with torch.no_grad():
+            target.target_rotation_params.add_(torch.linspace(
+                -0.01, 0.02, target.target_rotation_params.numel(), dtype=torch.double))
+            target.orbital_rotation_params.add_(torch.linspace(
+                -0.02, 0.01, target.orbital_rotation_params.numel(), dtype=torch.double))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            restart_path = f"{tmpdir}/target_restart.json"
+            target.save_restart_file(restart_path)
+            resumed = TargetStateMultistateMatrixDensityCAS.from_guess(
+                mol, 2, 2, target_states=2,
+                spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+            resumed.load_restart_file(restart_path)
+
+        torch.testing.assert_close(resumed.target_coefficients(), target.target_coefficients())
+        torch.testing.assert_close(resumed.orbital_coefficients(), target.orbital_coefficients())
+        self.assertEqual(
+            resumed.state_diagnostics()["spin_multiplicity"],
+            target.state_diagnostics()["spin_multiplicity"],
+        )
+
+    def test_stiefel_zero_params_matches_full_rotation_target_coefficients(self):
+        mol = self.create_test_molecules()['lithium hydride']
+        full = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, target_states=3,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="full_rotation")
+        stiefel = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, target_states=3,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="stiefel_k")
+
+        torch.testing.assert_close(stiefel.target_coefficients(), full.target_coefficients())
+        torch.testing.assert_close(stiefel.density_matrices_ao(), full.density_matrices_ao())
+
+    def test_stiefel_target_parameter_count(self):
+        mol = self.create_test_molecules()['lithium hydride']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, target_states=3,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="stiefel_k")
+
+        self.assertEqual(
+            target.target_rotation_params.size(),
+            Size([target.number_of_csfs - target.number_of_states, target.number_of_states]),
+        )
+        self.assertEqual(
+            target.target_rotation_params.numel(),
+            (target.number_of_csfs - target.number_of_states) * target.number_of_states,
+        )
+
+    def test_stiefel_target_orthonormality_invariant(self):
+        mol = self.create_test_molecules()['lithium hydride']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 4, 4, target_states=3,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="stiefel_k")
+        with torch.no_grad():
+            target.target_rotation_params.copy_(torch.linspace(
+                -0.03, 0.04, target.target_rotation_params.numel(), dtype=torch.double
+            ).reshape_as(target.target_rotation_params))
+
+        self.assertLess(target.target_orthonormality_error().item(), 1.0e-12)
+
+    def test_stiefel_target_density_autograd(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target0 = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="stiefel_k")
+        coords = numpy.array([[0.0, 0.0, 0.0], [0.2, -0.1, 0.1]])
+        ao_value = torch.from_numpy(pyscf.dft.numint.eval_ao(mol, coords, deriv=0)).to(dtype=torch.double)
+        batch = AOGridBatch(weights=None, ao_value=ao_value)
+
+        def wrapper_function(orbital_rotation_params, target_rotation_params):
+            target = TargetStateMultistateMatrixDensityCAS(
+                mol,
+                2,
+                2,
+                2,
+                target0.mo_coeff_guess,
+                orbital_rotation_params,
+                target0.det_to_csf,
+                target0.s2_matrix,
+                target0.active_space,
+                spin_symmetry=True,
+                spin_type=SpinType.UNPOLARIZED,
+                target_rotation_params=target_rotation_params,
+                target_parameterization="stiefel_k",
+            )
+            D, _, _ = target.evaluate_from_mo_grid_batch(batch)
+            return D
+
+        orbital_rotation_params = random_tensor(target0.orbital_rotation_params.size())
+        orbital_rotation_params.requires_grad_(True)
+        target_rotation_params = random_tensor(target0.target_rotation_params.size())
+        target_rotation_params.requires_grad_(True)
+        gradcheck(wrapper_function, (orbital_rotation_params, target_rotation_params))
+
+    def test_stiefel_restart_roundtrip_and_cross_mode_rejection(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        stiefel = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="stiefel_k")
+        with torch.no_grad():
+            stiefel.target_rotation_params.add_(0.01)
+
+        state = stiefel.restart_state()
+        restored = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="stiefel_k")
+        restored.load_restart_state(state)
+
+        torch.testing.assert_close(restored.target_rotation_params, stiefel.target_rotation_params)
+        torch.testing.assert_close(restored.target_coefficients(), stiefel.target_coefficients())
+
+        full = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="full_rotation")
+        with self.assertRaises(ValueError):
+            full.load_restart_state(state)
+
+    def test_stiefel_basis_transformation_resets_rectangular_params(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore',
+            target_parameterization="stiefel_k")
+        old_shape = target.target_rotation_params.size()
+        L = torch.eye(target.number_of_states, dtype=torch.double)
+
+        target.basis_transformation(L)
+
+        self.assertEqual(target.target_rotation_params.size(), old_shape)
+        self.assertLess(target.target_orthonormality_error().item(), 1.0e-12)
 
 
 if __name__ == "__main__":

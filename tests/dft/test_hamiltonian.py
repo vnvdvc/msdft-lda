@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 import numpy
+import importlib.util
+import pathlib
 import pyscf.gto
 import torch
 from torch import Tensor
@@ -14,16 +16,23 @@ import warnings
 from mlmsdft.dft.density import MultistateMatrixDensity
 from mlmsdft.dft.density import MultistateMatrixDensityCAS
 from mlmsdft.dft.density import MultistateMatrixDensityKohnSham
+from mlmsdft.dft.density import TargetStateMultistateMatrixDensityCAS
 from mlmsdft.dft.hamiltonian import Hamiltonian
 from mlmsdft.dft.hamiltonian import HamiltonianSemilocal
+from mlmsdft.dft.hamiltonian import HamiltonianTargetStateLMDA
+from mlmsdft.dft.hamiltonian import noncollinear_channel_densities
 from mlmsdft.dft.hamiltonian import minimize_subspace_energy
+from mlmsdft.dft.hartree_gpu4pyscf import HartreeFunctionalGpu4PySCFDFAO
+from mlmsdft.dft.hartree_gpu4pyscf import gpu4pyscf_environment_probe
 from mlmsdft.dft.spin import SpinType
 from mlmsdft.dft.spin import concat_spin_blocks, spin_trace
 from mlmsdft.dft.xc import lda_c_chachiyo, lda_x_dirac
 from mlmsdft.dft.pure import (
     LDA,
 )
+from mlmsdft.optim.torch_optimizer import WrappedOptimizer
 import mlmsdft.nn.functional as MF
+import mlmsdft.dft.hamiltonian as hamiltonian_mod
 
 from dft.fixture import FixtureMixin
 # Need to change name of class to avoid running unittest on it.
@@ -67,6 +76,19 @@ def _matrix_elements_single_chunk(self: HamiltonianSemilocal, msmd: MultistateMa
     :return hamiltonian: Hamiltonian matrix Hᵢⱼ
     :rtype hamiltonian: Tensor of shape (Nstate,Nstate)
     """
+    old_grid_chunks = self.grid_chunks
+    old_cache = self._ao_grid_cache
+    old_cache_key = self._ao_grid_cache_key
+    try:
+        self.grid_chunks = 1
+        self._ao_grid_cache = None
+        self._ao_grid_cache_key = None
+        return HamiltonianSemilocal.matrix_elements(self, msmd)
+    finally:
+        self.grid_chunks = old_grid_chunks
+        self._ao_grid_cache = old_cache
+        self._ao_grid_cache_key = old_cache_key
+
     # Check that the same geometry and basis is used for defining
     # the Hamiltonian and the matrix density.
     assert id(self.mol) == id(msmd.mol)
@@ -305,6 +327,405 @@ def _matrix_elements_single_chunk(self: HamiltonianSemilocal, msmd: MultistateMa
 
 
 class TestHamiltonian(unittest.TestCase, FixtureMixin):
+    def test_noncollinear_channel_densities_reduce_to_collinear_spin_blocks(self):
+        Daa = torch.tensor([
+            [[1.2, 0.1], [0.1, 0.8]],
+            [[0.7, 0.0], [0.0, 0.5]],
+        ], dtype=torch.double)
+        Dbb = torch.tensor([
+            [[0.4, 0.05], [0.05, 0.3]],
+            [[0.2, 0.0], [0.0, 0.1]],
+        ], dtype=torch.double)
+        spin_D = torch.zeros((2, 2) + Daa.size(), dtype=torch.double)
+        spin_D[0, 0, ...] = Daa
+        spin_D[1, 1, ...] = Dbb
+
+        D_plus, D_minus, spin_direction = noncollinear_channel_densities(
+            spin_D, spin_vector_regularization=1.0e-10)
+
+        torch.testing.assert_close(D_plus, Daa, rtol=1.0e-12, atol=1.0e-12)
+        torch.testing.assert_close(D_minus, Dbb, rtol=1.0e-12, atol=1.0e-12)
+        self.assertIsNone(spin_direction)
+
+    def test_target_state_one_electron_mo_matches_ao_backend(self):
+        cases = [
+            (self.create_test_molecules()["hydrogen molecule"], 2, 2, 2, "hydrogen molecule"),
+            (self.create_test_molecules()["lithium hydride"], 4, 4, 3, "lithium hydride"),
+            (pyscf.gto.M(atom="C 0 0 0; C 0 0 1.25", basis="sto-3g", spin=0), 2, 2, 2, "carbon dimer"),
+        ]
+        for mol, norb, nelec, target_states, molecule in cases:
+            with self.subTest(molecule=molecule):
+                msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+                    mol, norb, nelec, target_states=target_states,
+                    spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+                hamiltonian = HamiltonianTargetStateLMDA(mol, hartree_backend="ao")
+                one_mo = hamiltonian.one_electron_matrix(msmd)
+                dm = torch.einsum('ss...->...', msmd.density_matrices_ao())
+                one_ao = hamiltonian_mod.NuclearFunctionalAO(mol)(dm) + hamiltonian_mod.KineticFunctionalAO(mol)(dm)
+                torch.testing.assert_close(one_mo, one_ao, rtol=1.0e-9, atol=1.0e-9)
+
+    def test_target_state_lmda_hamiltonian_matches_semilocal_h2_full_space(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        dense = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=dense.number_of_states,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+        reference = HamiltonianSemilocal(
+            mol,
+            exchange_functional=lda_x_dirac,
+            correlation_functional=lda_c_chachiyo,
+            spin_type=SpinType.UNPOLARIZED,
+            grid_level=1,
+            grid_chunks=2,
+        )
+        target_hamiltonian = HamiltonianTargetStateLMDA(
+            mol,
+            exchange_functional=lda_x_dirac,
+            correlation_functional=lda_c_chachiyo,
+            spin_type=SpinType.UNPOLARIZED,
+            grid_level=1,
+            grid_chunks=2,
+            hartree_backend="ao",
+        )
+        torch.testing.assert_close(
+            target_hamiltonian(target), reference(dense), rtol=1.0e-8, atol=1.0e-8)
+
+    def test_stiefel_target_hamiltonian_zero_params_matches_full_rotation(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        full = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore",
+            target_parameterization="full_rotation")
+        stiefel = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore",
+            target_parameterization="stiefel_k")
+        hamiltonian = HamiltonianTargetStateLMDA(
+            mol,
+            exchange_functional=lda_x_dirac,
+            correlation_functional=lda_c_chachiyo,
+            spin_type=SpinType.UNPOLARIZED,
+            grid_level=1,
+            grid_chunks=2,
+            hartree_backend="ao",
+        )
+
+        torch.testing.assert_close(
+            hamiltonian(stiefel), hamiltonian(full), rtol=1.0e-10, atol=1.0e-10)
+
+    def test_target_state_noncollinear_lmda_hamiltonian_matches_semilocal_h2_full_space(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        dense = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess="hcore")
+        target = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=dense.number_of_states,
+            spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess="hcore")
+        reference = HamiltonianSemilocal(
+            mol,
+            exchange_functional=lda_x_dirac,
+            correlation_functional=lda_c_chachiyo,
+            spin_type=SpinType.NONCOLLINEAR,
+            grid_level=1,
+            grid_chunks=2,
+        )
+        target_hamiltonian = HamiltonianTargetStateLMDA(
+            mol,
+            exchange_functional=lda_x_dirac,
+            correlation_functional=lda_c_chachiyo,
+            spin_type=SpinType.NONCOLLINEAR,
+            grid_level=1,
+            grid_chunks=2,
+            hartree_backend="ao",
+        )
+        torch.testing.assert_close(
+            target_hamiltonian(target), reference(dense), rtol=1.0e-8, atol=1.0e-8)
+
+    def test_target_state_noncollinear_rejects_fused_xc_functional(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        xc_functional = LDA(mol)
+        with self.assertRaises(NotImplementedError):
+            HamiltonianTargetStateLMDA(
+                mol,
+                exchange_functional=None,
+                correlation_functional=None,
+                exchange_correlation_functional=xc_functional.exchange_correlation,
+                spin_type=SpinType.NONCOLLINEAR,
+            )
+
+    def test_target_state_noncollinear_xc_autograd(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess="hcore")
+        hamiltonian = HamiltonianTargetStateLMDA(
+            mol,
+            spin_type=SpinType.NONCOLLINEAR,
+            grid_level=1,
+            grid_chunks=2,
+            hartree_backend="ao",
+        )
+        energy = torch.trace(hamiltonian.exchange_correlation_matrix(msmd))
+        energy.backward()
+
+        self.assertIsNotNone(msmd.target_rotation_params.grad)
+        self.assertIsNotNone(msmd.orbital_rotation_params.grad)
+        self.assertFalse(msmd.target_rotation_params.grad.isnan().any())
+        self.assertFalse(msmd.orbital_rotation_params.grad.isnan().any())
+
+    def test_torch_lbfgs_optimizer_smoke_preserves_noncollinear_target_orthonormality(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=False, spin_type=SpinType.NONCOLLINEAR, guess="hcore")
+        hamiltonian = HamiltonianTargetStateLMDA(
+            mol,
+            spin_type=SpinType.NONCOLLINEAR,
+            grid_level=1,
+            grid_chunks=2,
+            hartree_backend="ao",
+        )
+        energies, optimized = minimize_subspace_energy(
+            hamiltonian,
+            msmd,
+            optimizer="torch_lbfgs",
+            maxiter=2,
+            gtol=1.0e-8,
+        )
+
+        self.assertEqual(energies.size(), torch.Size([msmd.number_of_states]))
+        self.assertFalse(energies.isnan().any())
+        self.assertLess(optimized.target_orthonormality_error().item(), 1.0e-10)
+        self.assertLess(optimized.orbital_orthonormality_error().item(), 1.0e-8)
+
+    def test_gpu4pyscf_hartree_backend_fallback_matches_ao(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+        dm = torch.einsum('ss...->...', msmd.density_matrices_ao())
+        fallback = HartreeFunctionalGpu4PySCFDFAO(mol, allow_fallback=True)
+        reference = hamiltonian_mod.HartreeFunctionalAO(mol)
+        if not fallback.using_fallback:
+            self.skipTest("GPU4PySCF is installed; fallback path is not active.")
+        torch.testing.assert_close(fallback(dm), reference(dm))
+
+    def test_gpu4pyscf_environment_probe_reports_required_keys(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        info = gpu4pyscf_environment_probe(mol)
+        for key in [
+            "gpu4pyscf_available",
+            "cupy_available",
+            "torch_cuda_available",
+            "df_build_succeeded",
+            "torch_version",
+        ]:
+            self.assertIn(key, info)
+
+    def test_gpu4pyscf_direct_path_rejects_cpu_without_fallback(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+        dm = torch.einsum('ss...->...', msmd.density_matrices_ao())
+        backend = HartreeFunctionalGpu4PySCFDFAO(mol, allow_fallback=False, dfobj=object())
+        with self.assertRaises(ValueError):
+            backend(dm)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for direct GPU4PySCF DLPack test")
+    def test_gpu4pyscf_direct_path_fake_builder_autograd(self):
+        try:
+            import cupy
+        except ImportError:
+            self.skipTest("CuPy is required for direct GPU4PySCF DLPack test")
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+        dm = torch.einsum('ss...->...', msmd.density_matrices_ao()).detach().cuda().requires_grad_(True)
+
+        def fake_j_builder(dm_batch):
+            return dm_batch
+
+        backend = HartreeFunctionalGpu4PySCFDFAO(
+            mol, allow_fallback=False, dfobj=object(), j_builder=fake_j_builder)
+        energy = torch.trace(backend(dm))
+        energy.backward()
+        self.assertIsNotNone(dm.grad)
+        self.assertFalse(dm.grad.isnan().any())
+
+    def test_target_state_hartree_backward_finite_difference(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+        dm = torch.einsum('ss...->...', msmd.density_matrices_ao()).detach().requires_grad_(True)
+        hartree = hamiltonian_mod.HartreeFunctionalAO(mol)
+
+        def scalar_energy(x):
+            return torch.trace(hartree(x))
+
+        energy = scalar_energy(dm)
+        energy.backward()
+        idx = (0, 0, 0, 0)
+        h = 1.0e-5
+        dm_plus = dm.detach().clone()
+        dm_minus = dm.detach().clone()
+        dm_plus[idx] += h
+        dm_minus[idx] -= h
+        finite_diff = (scalar_energy(dm_plus) - scalar_energy(dm_minus)) / (2 * h)
+        torch.testing.assert_close(dm.grad[idx], finite_diff, rtol=1.0e-4, atol=1.0e-5)
+
+    def test_torch_lbfgs_optimizer_smoke_preserves_target_orthonormality(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess="hcore")
+        hamiltonian = HamiltonianTargetStateLMDA(mol, hartree_backend="ao")
+        energies, optimized = minimize_subspace_energy(
+            hamiltonian,
+            msmd,
+            optimizer="torch_lbfgs",
+            maxiter=2,
+            gtol=1.0e-8,
+        )
+
+        self.assertEqual(energies.size(), torch.Size([msmd.number_of_states]))
+        self.assertLess(optimized.target_orthonormality_error().item(), 1.0e-10)
+        self.assertLess(optimized.orbital_orthonormality_error().item(), 1.0e-8)
+        self.assertEqual(optimized.optimizer_telemetry["numpy_parameter_transfers"], 0)
+        self.assertEqual(optimized.optimizer_telemetry["numpy_gradient_transfers"], 0)
+        self.assertGreater(optimized.optimizer_telemetry["closure_calls"], 0)
+
+    def test_wrapped_optimizer_reports_numpy_transfers(self):
+        param = torch.nn.Parameter(torch.tensor([0.25], dtype=torch.double))
+        optimizer = WrappedOptimizer([param], maxiter=5, gtol=1.0e-12)
+
+        def closure():
+            optimizer.zero_grad()
+            return torch.sum(param * param)
+
+        optimizer.step(closure)
+        self.assertGreater(optimizer.telemetry.numpy_parameter_transfers, 0)
+        self.assertGreater(optimizer.telemetry.numpy_gradient_transfers, 0)
+
+    def test_phase_f_validation_artifact_writer_smoke(self):
+        script_path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "target_state_phase_f_validation.py"
+        spec = importlib.util.spec_from_file_location("target_state_phase_f_validation", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = {
+            "molecule": "H2",
+            "coordinate_label": "R_HH_Angstrom",
+            "coordinate_value": 0.7,
+            "geometry_id": "H2_R_0.700",
+            "charge": 0,
+            "spin": 0,
+            "basis": "sto-3g",
+            "active_space": "CAS(2,2)",
+            "target_states": 2,
+            "functional": "LMDA(LDA_X + LDA_C_CHACHIYO)",
+            "grid_level": 1,
+            "hartree_backend": "ao",
+            "optimizer": "torch_lbfgs",
+            "device": "cpu",
+            "runtime_seconds": 0.01,
+            "energies_hartree": [-1.0, -0.5],
+            "excitations_ev": [0.0, 13.6],
+            "diagnostics": {
+                "target_orthonormality_error": 0.0,
+                "orbital_orthonormality_error": 0.0,
+            },
+            "optimizer_telemetry": {},
+        }
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = module.write_artifacts([result], pathlib.Path(tmpdir))
+            for path in paths:
+                self.assertTrue(path.exists())
+                self.assertGreater(path.stat().st_size, 0)
+
+    def test_ao_grid_cache_uses_lmda_derivative_level(self):
+        """LDA/LMDA Hamiltonians should cache AO values with deriv=0 only."""
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, guess="hcore", spin_symmetry=False, spin_type=SpinType.POLARIZED)
+        hamiltonian = HamiltonianSemilocal(
+            mol,
+            exchange_functional=lda_x_dirac,
+            correlation_functional=lda_c_chachiyo,
+            spin_type=SpinType.POLARIZED,
+            grid_level=1,
+            grid_chunks=2,
+        )
+        self.assertFalse(hamiltonian.need_gradient)
+        self.assertFalse(hamiltonian.need_laplacian)
+
+        spin_dm = msmd.density_matrices_ao()
+        original_eval_ao = hamiltonian_mod.numint.eval_ao
+
+        def eval_ao_spy(*args, **kwargs):
+            return original_eval_ao(*args, **kwargs)
+
+        with unittest.mock.patch.object(hamiltonian_mod.numint, "eval_ao", side_effect=eval_ao_spy) as patched_eval_ao:
+            batches_first = hamiltonian._get_ao_grid_cache(dtype=spin_dm.dtype, device=spin_dm.device)
+            batches_second = hamiltonian._get_ao_grid_cache(dtype=spin_dm.dtype, device=spin_dm.device)
+
+        self.assertIs(batches_first, batches_second)
+        self.assertEqual(patched_eval_ao.call_count, hamiltonian.grid_chunks)
+        for call in patched_eval_ao.call_args_list:
+            self.assertEqual(call.kwargs["deriv"], 0)
+        for batch in batches_first:
+            self.assertIsNone(batch.grad_ao_value)
+            self.assertIsNone(batch.lapl_ao_value)
+
+    def test_auto_grid_chunks_respects_memory_budget(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, guess="hcore", spin_symmetry=False, spin_type=SpinType.POLARIZED)
+        hamiltonian = HamiltonianSemilocal(
+            mol,
+            spin_type=SpinType.POLARIZED,
+            grid_level=1,
+            grid_chunks="auto",
+        )
+        dtype = torch.double
+        device = torch.device("cpu")
+        bytes_per_grid = hamiltonian._estimate_bytes_per_grid_point(dtype, msmd.number_of_states)
+        ngrids = len(hamiltonian.grids.coords)
+
+        with unittest.mock.patch.object(hamiltonian, "_available_memory_bytes", return_value=bytes_per_grid):
+            chunks_low_memory = hamiltonian._resolve_grid_chunks(dtype, device, msmd)
+        with unittest.mock.patch.object(hamiltonian, "_available_memory_bytes", return_value=bytes_per_grid * ngrids * 2):
+            chunks_high_memory = hamiltonian._resolve_grid_chunks(dtype, device, msmd)
+
+        self.assertGreaterEqual(chunks_low_memory, 1)
+        self.assertEqual(chunks_high_memory, 1)
+        self.assertGreaterEqual(chunks_low_memory, chunks_high_memory)
+
+    def test_auto_grid_chunks_hamiltonian_matches_explicit_chunks(self):
+        mol = self.create_test_molecules()["hydrogen molecule"]
+        msmd = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, guess="hcore", spin_symmetry=False, spin_type=SpinType.POLARIZED)
+        hamiltonian_ref = HamiltonianSemilocal(
+            mol,
+            spin_type=SpinType.POLARIZED,
+            grid_level=1,
+            grid_chunks=2,
+        )
+        hamiltonian_auto = HamiltonianSemilocal(
+            mol,
+            spin_type=SpinType.POLARIZED,
+            grid_level=1,
+            grid_chunks="auto",
+            max_grid_points_per_chunk=max(1, len(hamiltonian_ref.grids.coords) // 2),
+        )
+        H_ref = hamiltonian_ref(msmd)
+        H_auto = hamiltonian_auto(msmd)
+        self.assertIsNotNone(hamiltonian_auto.resolved_grid_chunks)
+        self.assertGreaterEqual(hamiltonian_auto.resolved_grid_chunks, 1)
+        torch.testing.assert_close(H_auto, H_ref)
+
     def test_minimize_kohn_sham_energy_h2(self):
         """
         Minimize energy of a Kohn-Sham determinant starting from
@@ -518,6 +939,28 @@ class TestHamiltonian(unittest.TestCase, FixtureMixin):
 
         self.assertAlmostEqual(kohn_sham_energy, kohn_sham_energy_pyscf, places=6)
 
+    def test_minimize_subspace_energy_can_return_convergence_info(self):
+        mol = self.create_test_molecules()['hydrogen molecule']
+        msmd = TargetStateMultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, target_states=2,
+            spin_symmetry=True, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        hamiltonian = HamiltonianTargetStateLMDA(mol, hartree_backend="ao")
+
+        energies, optimized, info = minimize_subspace_energy(
+            hamiltonian,
+            msmd,
+            optimizer="torch_lbfgs",
+            maxiter=1,
+            convergence={"gtol": 1.0e6, "ftol": 1.0e6},
+            return_info=True,
+        )
+
+        self.assertEqual(len(energies), optimized.number_of_states)
+        self.assertIn("optimizer_convergence", info)
+        self.assertIn("optimizer_telemetry", info)
+        self.assertIn("final_grad_norm", info["optimizer_convergence"])
+        self.assertIn("history_tail", info["optimizer_convergence"])
+
     def test_lda_kohn_sham_energy_vs_pyscf(self):
         """
         Compare Kohn-Sham energies for LDA functionals with pyscf
@@ -570,12 +1013,55 @@ class TestHamiltonian(unittest.TestCase, FixtureMixin):
 
         self.assertAlmostEqual(kohn_sham_energy, kohn_sham_energy_pyscf, places=6)
 
+    def test_fused_pure_xc_functional_matches_separate_xc_path(self):
+        mol = pyscf.gto.M(
+            atom='H 0 0 -0.35; H 0 0 0.35',
+            basis='6-31g',
+            charge=0,
+            spin=0)
+        msmd = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=False, spin_type=SpinType.UNPOLARIZED, guess='hcore')
+        xc_functional = LDA(mol)
+        h_separate = HamiltonianSemilocal(
+            mol,
+            exchange_functional=xc_functional.exchange,
+            correlation_functional=xc_functional.correlation,
+            spin_type=SpinType.UNPOLARIZED)
+        h_fused = HamiltonianSemilocal(
+            mol,
+            exchange_functional=None,
+            correlation_functional=None,
+            exchange_correlation_functional=xc_functional.exchange_correlation,
+            spin_type=SpinType.UNPOLARIZED)
+        torch.testing.assert_close(
+            h_fused(msmd), h_separate(msmd), rtol=1.0e-8, atol=1.0e-8)
+
+    def test_fused_pure_xc_functional_rejects_spin_resolved_paths(self):
+        mol = pyscf.gto.M(
+            atom='H 0 0 -0.35; H 0 0 0.35',
+            basis='6-31g',
+            charge=0,
+            spin=0)
+        xc_functional = LDA(mol)
+        for spin_type in [SpinType.POLARIZED, SpinType.NONCOLLINEAR]:
+            with self.subTest(spin_type=spin_type):
+                msmd = MultistateMatrixDensityCAS.from_guess(
+                    mol, 2, 2, spin_symmetry=False, spin_type=spin_type, guess='hcore')
+                h_fused = HamiltonianSemilocal(
+                    mol,
+                    exchange_functional=None,
+                    correlation_functional=None,
+                    exchange_correlation_functional=xc_functional.exchange_correlation,
+                    spin_type=spin_type)
+                with self.assertRaises(NotImplementedError):
+                    h_fused(msmd)
+
     def test_composite_pure_xc_functional_vs_pyscf(self):
         """
         Compare Kohn-Sham energies for pure composite xc-functional with pyscf
         """
         mol = self.create_test_molecules()['hydrogen molecule']
-        for spin_type in SpinType:
+        for spin_type in [SpinType.UNPOLARIZED, SpinType.POLARIZED, SpinType.NONCOLLINEAR]:
             for xc_functional_class, xc_code in [
                     (LDA, 'LDA_X,LDA_C_CHACHIYO'),
             ]:
@@ -587,6 +1073,43 @@ class TestHamiltonian(unittest.TestCase, FixtureMixin):
                 ):
                     self.check_composite_pure_xc_functional_vs_pyscf(
                         mol, xc_functional_class, xc_code, spin_type=spin_type)
+
+    def test_noncollinear_matches_polarized_collinear_limit(self):
+        mol = pyscf.gto.M(
+            atom='H 0 0 -0.35; H 0 0 0.35',
+            basis='6-31g',
+            charge=0,
+            spin=0)
+        msmd = MultistateMatrixDensityCAS.from_guess(
+            mol, 2, 2, spin_symmetry=False, spin_type=SpinType.POLARIZED, guess='hcore')
+        xc_functional = LDA(mol)
+        h_pol = HamiltonianSemilocal(
+            mol,
+            exchange_functional=xc_functional.exchange,
+            correlation_functional=xc_functional.correlation,
+            spin_type=SpinType.POLARIZED)
+        h_noncol = HamiltonianSemilocal(
+            mol,
+            exchange_functional=xc_functional.exchange,
+            correlation_functional=xc_functional.correlation,
+            spin_type=SpinType.NONCOLLINEAR)
+        H_pol = h_pol(msmd)
+        H_noncol = h_noncol(msmd)
+        torch.testing.assert_close(H_noncol, H_pol, rtol=1.0e-8, atol=1.0e-8)
+
+    def test_deprecated_invariant_spin_types_raise(self):
+        mol = pyscf.gto.M(
+            atom='H 0 0 -0.35; H 0 0 0.35',
+            basis='6-31g',
+            charge=0,
+            spin=0)
+        for spin_type in [SpinType.INVARIANT, SpinType.INVARIANT_MIX]:
+            with self.subTest(spin_type=spin_type):
+                msmd = MultistateMatrixDensityCAS.from_guess(
+                    mol, 2, 2, spin_symmetry=False, spin_type=spin_type, guess='hcore')
+                hamiltonian = HamiltonianSemilocal(mol, spin_type=spin_type)
+                with self.assertRaises(NotImplementedError):
+                    hamiltonian(msmd)
 
     def check_basis_transformation_cas(self, msmd: MultistateMatrixDensityCAS):
         """

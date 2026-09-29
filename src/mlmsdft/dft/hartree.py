@@ -11,6 +11,8 @@ from torch import Tensor
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
+from mlmsdft.dft.integrals import RangeSeparatedIntegralCache
+
 
 class _HartreeFunctionalAO(Function):
     """
@@ -146,3 +148,44 @@ class HartreeFunctionalAO(torch.nn.Module):
         self.mol = mol
     def forward(self, density_matrices_ao: Tensor) -> Tensor:
         return _HartreeFunctionalAO.apply(density_matrices_ao, self.mol)
+
+
+class _HartreeFunctionalERI(Function):
+    """Differentiable Hartree-like contraction for a fixed ERI tensor."""
+
+    @staticmethod
+    def forward(ctx, density_matrices_ao: Tensor, eri_ao: Tensor) -> Tensor:
+        # V_ab,kj = (ab|cd) D_cd,kj and
+        # J_ij = 1/2 D_ab,ik V_ab,kj.
+        potential = torch.einsum("abcd,cdij->abij", eri_ao, density_matrices_ao)
+        ctx.save_for_backward(potential)
+        return 0.5 * torch.einsum("abik,abkj->ij", density_matrices_ao, potential)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: Tensor):
+        (potential,) = ctx.saved_tensors
+        grad_density = 0.5 * (
+            torch.einsum("mj,abjn->abmn", grad_output, potential) +
+            torch.einsum("abmj,jn->abmn", potential, grad_output)
+        )
+        return grad_density, None
+
+
+class HartreeFunctionalShortRangeAO(torch.nn.Module):
+    """Hartree complement using the erfc short-range kernel."""
+
+    def __init__(self, mol: pyscf.gto.Mole, omega: float):
+        super().__init__()
+        self.integrals = RangeSeparatedIntegralCache(mol, omega)
+
+    @property
+    def omega(self) -> float:
+        return self.integrals.omega
+
+    def forward(self, density_matrices_ao: Tensor) -> Tensor:
+        eri = self.integrals.eri_ao("short_range").to(
+            dtype=density_matrices_ao.dtype,
+            device=density_matrices_ao.device,
+        )
+        return _HartreeFunctionalERI.apply(density_matrices_ao, eri)
